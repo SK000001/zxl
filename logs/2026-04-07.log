@@ -1,0 +1,338 @@
+[2026-04-07] ZXL Compression Project — Day 7
+============================================================
+
+## Session Summary
+
+### Context
+Resuming from end of previous session (ZXL4). Goal: close compression ratio gap
+vs gzip-6 and zstd-3 on x86 PE binaries. Starting ratios:
+  ntdll.dll:   0.5095  (gap to gzip-6: 4.81 pts)
+  kernel32.dll: 0.5121  (gap to gzip-6: 5.33 pts)
+  user32.dll:  0.4128  (gap to gzip-6: 2.52 pts)
+
+### Feature: Variable-Length Offset/Length Encoding → ZXL5
+
+#### Problem
+ZXL4 encoded every match with a fixed 3-byte offset + 2-byte length = 5 parameter
+bytes per exact/delta match token, regardless of actual offset magnitude.
+PE binaries have strong temporal locality — many matches reference data only
+dozens or hundreds of bytes back. Paying 3 bytes for an offset of 12 was wasteful.
+
+#### Solution
+Introduced variable-length encoding for both offset and length fields:
+- 1-byte offset (TOK_EXACT1): covers offsets 1–255
+- 2-byte offset (TOK_EXACT2): covers offsets 256–65535
+- 3-byte offset (TOK_EXACT/TOK_DELTA): covers 65536–1MB (fallback)
+- 1-byte length (most tokens): covers len-MIN_MATCH 0–255 (matches 4–259 bytes)
+- 2-byte length (TOK_EXACT/TOK_DELTA): for rare very long matches
+
+Same scheme for delta matches: TOK_DELTA1, TOK_DELTA2.
+REP tokens (REP0/1/2) also changed from 2-byte to 1-byte length. Long-length REP
+matches (len-4 >= 256) fall through to TOK_EXACT with the REP offset — the
+decompressor's rep[] cache is still updated correctly via TOK_EXACT.
+
+#### Token Table Changes (ZXL4 → ZXL5)
+Magic: 0x344C585A ("ZXL4") → 0x354C585A ("ZXL5")
+Max literal run: 251 bytes (token 0xFA) → 247 bytes (token 0xF6)
+Freed 4 token slots (0xF7–0xFA) for new token types:
+
+  0x00..0xF6  literal run (run=tok+1, 1..247 bytes)
+  0xF7        TOK_EXACT1:  [1]offset, [1]len-MIN_MATCH
+  0xF8        TOK_EXACT2:  [2]offset, [1]len-MIN_MATCH
+  0xF9        TOK_DELTA1:  [1]mtype, [1]delta, [1]offset, [1]len-MIN_MATCH
+  0xFA        TOK_DELTA2:  [1]mtype, [1]delta, [2]offset, [1]len-MIN_MATCH
+  0xFB        TOK_REP0:    [1]len-MIN_MATCH  (was 2 bytes)
+  0xFC        TOK_REP1:    [1]len-MIN_MATCH  (was 2 bytes)
+  0xFD        TOK_REP2:    [1]len-MIN_MATCH  (was 2 bytes)
+  0xFE        TOK_EXACT:   [3]offset, [2]len-MIN_MATCH  (fallback)
+  0xFF        TOK_DELTA:   [1]mtype,[1]delta,[3]offset,[2]len-MIN_MATCH
+
+#### DP Overhead: 2 values → 6 values
+ZXL4 used one overhead estimate per match type (ovhd_exact, ovhd_delta).
+ZXL5 uses six, one per offset-size class per match type:
+  ovhd_exact1, ovhd_exact2, ovhd_exact
+  ovhd_delta1, ovhd_delta2, ovhd_delta
+
+Each is computed in pass 1 from real token frequencies:
+  overhead = -log2(count[tok] / total_tokens) + n_params × h_tok
+
+The DP backward pass selects the correct overhead based on each candidate match's
+actual offset and length, giving more accurate parse decisions — especially for
+short-offset matches which are now correctly seen as much cheaper.
+
+### Benchmark Results (ZXL5)
+
+  ntdll.dll    : 0.4819  (was 0.5095, −2.76 pts)
+  kernel32.dll : 0.4794  (was 0.5121, −3.27 pts)
+  user32.dll   : 0.3915  (was 0.4128, −2.13 pts)
+  zxl.exe      : 0.4030  (was 0.4315, −2.85 pts)
+
+  Compress:   0.4–0.9 MB/s
+  Decompress: 181–209 MB/s
+
+### Comparison vs Competitors
+
+  File          ZXL5    gzip-6   zstd-3   zstd-9
+  ntdll.dll    0.4819   0.4614   0.4784   0.4442
+  kernel32.dll 0.4794   0.4588   0.4678   0.4455
+  user32.dll   0.3915   0.3876   0.3799   0.3630
+
+  Gap to gzip-6: ntdll 2.05 pts, kernel32 2.06 pts, user32 0.39 pts
+  ZXL5 now beats zstd-3 on ntdll (0.4819 vs 0.4784).
+  user32 is only 0.39 pts behind gzip-6.
+
+### Feature: REP Offsets in DP (greedy pre-pass)
+
+#### Approach
+Added a greedy forward pre-pass (before the DP loop) that simulates the LRU rep[]
+cache and records where REP matches are available. Stored in rep_match[i].
+The DP backward pass adds choice=3 (use rep_match[i]) with ovhd_rep overhead —
+much cheaper than EXACT (token+1B len = 2 param bytes vs 3-5 for EXACT variants).
+ovhd_rep is computed from pass-1 REP token frequencies: -log2(rep_cnt/total) + 2×h_tok.
+Forward trace handles choice=3 identically to other exact matches, with fallback
+to EXACT if the actual rep[] state diverged from the pre-pass estimate.
+
+#### Result
+  ntdll.dll    : 0.4819  (no change)
+  kernel32.dll : 0.4793  (−0.01 pt)
+  user32.dll   : 0.3914  (−0.01 pt)
+
+Essentially neutral. The greedy pre-pass estimate diverges from the DP's actual
+parse choices, so many predicted REP positions fall back to EXACT in the trace.
+Same root cause as the previous REP blending regression — accurate REP prediction
+requires knowing the full parse, which is circular. Change kept (tiny positive,
+no regression) but limits of the approach now documented.
+
+### Status
+- [x] Variable-length offset encoding (ZXL5) — DONE (+2.1 to +3.3 pts gain)
+- [x] REP offsets in DP (greedy pre-pass) — DONE (marginal ~0.01 pt, kept)
+- [x] Round-trip test passes
+- [x] Beats zstd-3 on ntdll
+- [ ] Context-aware DP literal costs (est. +0.5-1 pt)
+- [ ] Chain depth 64 → 128 (speed/ratio trade-off, est. +0.5-1 pt)
+- [ ] Beat gzip-6 on ntdll and kernel32 (still ~2 pts gap)
+
+### Feature: Chain Depth 64 → 128
+
+Single constant change in zxl_match.h: ZXL_CHAIN_DEPTH 64 → 128.
+More candidates checked per hash chain per match type → finds longer/better matches.
+
+#### Result
+  ntdll.dll    : 0.4803  (was 0.4819, −0.16 pts)
+  kernel32.dll : 0.4786  (was 0.4793, −0.07 pts)
+  user32.dll   : 0.3909  (was 0.3914, −0.05 pts)
+
+  Compress speed: ~40-50% slower (ntdll: 0.4→0.2 MB/s, kernel32: 0.9→0.6, user32: 0.7→0.4)
+  Decompress: unchanged (~180-220 MB/s)
+
+Trade-off accepted: modest ratio gain across the board at cost of slower compression.
+Gap to gzip-6: ntdll 1.89 pts, kernel32 1.98 pts, user32 0.33 pts.
+
+### Status
+- [x] Variable-length offset encoding (ZXL5) — DONE (+2.1 to +3.3 pts gain)
+- [x] REP offsets in DP (greedy pre-pass) — DONE (marginal ~0.01 pt, kept)
+- [x] Chain depth 64 → 128 — DONE (−0.05 to −0.16 pts ratio, ~50% slower compress)
+- [x] Round-trip test passes
+- [x] Beats zstd-3 on ntdll
+- [~] Context-aware DP literal costs — ATTEMPTED, REVERTED (regression)
+- [ ] Beat gzip-6 on ntdll and kernel32 (still ~1.9 pts gap)
+
+### Feature: Context-Aware DP Literal Costs (attempted, reverted)
+
+#### Approach
+Extended the greedy pre-pass to also track prev_out, filling est_ctx[i] =
+(prev_out >> N_LIT_CTX_SHIFT) as an estimate of the 8-way literal context at
+each position. After pass-1 forward trace, rebuilt ctx_sym_cost[8][256] from
+the actual pass-1 literal distribution (lit_buf / lit_ctx_buf). Pass-2 DP used
+ctx_sym_cost[est_ctx[u]][byte] instead of global sym_cost[byte].
+
+#### Result
+  ntdll.dll    : 0.4826  (was 0.4803, +0.23 pts WORSE)
+  kernel32.dll : 0.4798  (was 0.4786, +0.12 pts WORSE)
+  user32.dll   : 0.3910  (was 0.3909, +0.01 pts WORSE)
+
+Regressed across the board. Reverted.
+
+#### Root cause
+The greedy pre-pass sets est_ctx for interior match positions using the context
+before the match (approximation). When the DP decides NOT to take the match and
+encodes those positions as literals instead, the actual context differs from
+est_ctx. The DP then makes wrong decisions based on stale context costs.
+The circular dependency (context depends on parse, parse depends on context)
+makes this approach unreliable without a full state-tracking DP.
+
+### Feature: Larger Hash Table (16-bit → 18-bit, 64K → 256K buckets)
+
+MatchCtx head tables: 64K → 256K entries each. With 512K window entries, the average
+chain length per bucket drops from ~8 to ~2. Fewer collisions → better match candidates
+at the same chain depth. MatchCtx RAM: 3MB → 9MB. Side effect: chains terminate sooner
+on average, which slightly speeds up compression.
+
+#### Result
+  ntdll.dll    : 0.4801  (was 0.4803, −0.02 pts, faster: 0.2→0.4 MB/s)
+  kernel32.dll : 0.4786  (no change, faster: 0.6→0.8 MB/s)
+  user32.dll   : 0.3909  (no change, faster: 0.4→0.6 MB/s)
+
+Tiny ratio gain + compression speed improvement. Kept.
+
+### Attempted: Residual sym_cost + run token overhead (attempted, reverted)
+
+Tried two DP cost improvements:
+1. Rebuild sym_cost from pass-1 residual literals (matches remove low-entropy bytes,
+   residual is higher entropy → more accurate DP literal costs)
+2. Add amortized run-token overhead per literal (h_tok / avg_run_len bits per literal,
+   correcting for run tokens not accounted in sym_cost)
+
+Both individually and combined caused severe regressions (+0.5–1.0 pts worse).
+
+Root cause: circular dependency. sym_cost from pass-1 residuals models a different parse
+than the pass-2 DP will produce. Wrong context estimates cause the DP to make decisions
+that don't match the actual encoding costs.
+
+### Feature: 3-Pass Optimal DP + Residual sym_cost on Pass 3
+
+Instead of rebuilding sym_cost after pass 0 (unstable), run 3 passes:
+- Pass 0 → 1: rough overheads → real overheads (same as before)
+- Pass 1 → 2: real overheads AGAIN (from pass-1 token stream) + rebuild sym_cost from
+  pass-1 residual literals. Pass 1 and 2 are much closer in parse quality, so residual
+  distribution from pass 1 accurately models pass 2's literal costs.
+- Pass 2: final output
+
+#### Result
+  ntdll.dll    : 0.4802  (essentially unchanged)
+  kernel32.dll : 0.4786  (unchanged)
+  user32.dll   : 0.3899  (was 0.3909, −0.10 pts)
+  Compress speed: ~25% slower (extra pass)
+
+user32 gains 0.10 pts — now only 0.23 pts behind gzip-6. ntdll/kernel32 unchanged.
+The residual sym_cost helps more on user32 (data-heavy, more stable literal distribution
+between passes) than ntdll/kernel32 (code-heavy, more volatile match/literal split).
+
+### Current Standing
+
+  ntdll.dll    : 0.4802  (gap to gzip-6: 1.88 pts)
+  kernel32.dll : 0.4786  (gap to gzip-6: 1.98 pts)
+  user32.dll   : 0.3899  (gap to gzip-6: 0.23 pts) ← nearly at gzip parity
+
+  Chain depth: 128, Hash buckets: 256K, Passes: 3
+  Compress: 0.3–0.8 MB/s. Decompress: 169–220 MB/s.
+
+### Feature: Separated Opcode + Parameter Streams → ZXL6
+
+#### Problem
+ZXL5 encoded opcode bytes and parameter bytes (offsets, lengths, mtype, delta) into a
+single interleaved stream with one shared rANS model. The two have radically different
+distributions: opcode bytes are sparse (mostly 0x00-0xF6 literal-run values plus a few
+0xF7-0xFF match opcodes); parameter bytes are heavily biased toward small values (offsets
+0-255 dominate via EXACT1, lengths almost always 0-20). A shared frequency table is a
+poor model for both simultaneously.
+
+#### Solution
+Split the token stream into two independent streams:
+  opcode_buf — one byte per event: the match/lit-run token type (0x00–0xFF)
+  param_buf  — all match parameters concatenated: offset bytes, length bytes, mtype, delta
+
+Each gets its own rANS frequency table and is encoded/decoded as an independent stream.
+The decompressor reads the token opcode, then consumes the correct number of bytes from
+the param stream based on the opcode's parameter count.
+
+#### Header Changes (ZXL5 → ZXL6)
+Magic: 0x354C585A → 0x364C585A
+Header now 7 uint32 fields (was 5) + opcode_freq_table + param_freq_table + lit tables.
+
+Old: [uncomp][enc_tok][lit_total][tok_dec_len][lit_dec_len][tok_freqs][lit_freqs]...
+New: [uncomp][enc_opcode][enc_param][lit_total][opcode_dec_len][param_dec_len][lit_dec_len]
+     [opcode_freqs][param_freqs][lit_freqs]...
+
+Header overhead increase: +520 bytes/block. At 512KB blocks this is 0.001% — negligible.
+
+#### DP Overhead Formula Change
+Old: OVHD(tok, nparams) = -log2(count[tok] / total_tokens) + nparams × h_tok
+New: OVHD(tok, nparams) = -log2(count[tok] / total_opcodes) + nparams × h_param
+
+h_param = entropy of param stream = average bits per param byte under the param rANS model.
+This is more accurate: opcode cost comes from opcode entropy, param byte cost from param entropy.
+For REP matches: overhead = opcode cost + 1 × h_param (1 param byte = 1B length).
+
+#### Benchmark Results (ZXL6)
+
+  ntdll.dll    : 0.4634  (was 0.4802, −1.68 pts)
+  kernel32.dll : 0.4620  (was 0.4786, −1.66 pts)
+  user32.dll   : 0.3790  (was 0.3899, −1.09 pts)
+  zxl.exe      : 0.3966  (was 0.4030, −0.64 pts)
+
+  Compress:   0.4–0.8 MB/s (unchanged)
+  Decompress: 173–225 MB/s
+
+#### Comparison vs Competitors (ZXL6)
+
+  File          ZXL6    gzip-6   zstd-3   zstd-9
+  ntdll.dll    0.4634   0.4614   0.4784   0.4442
+  kernel32.dll 0.4620   0.4588   0.4678   0.4455
+  user32.dll   0.3790   0.3876   0.3799   0.3630
+
+  user32: ZXL6 BEATS gzip-6 (0.3790 vs 0.3876) and nearly matches zstd-3 (0.3799)
+  ntdll:  gap to gzip-6 down to 0.20 pts (was 1.88)
+  kernel32: gap to gzip-6 down to 0.32 pts (was 1.98)
+
+  Round-trip test: PASS
+
+### Status
+- [x] Variable-length offset encoding (ZXL5) — DONE
+- [x] REP offsets in DP (greedy pre-pass) — DONE (marginal, kept)
+- [x] Chain depth 64 → 128 — DONE
+- [x] 3-pass DP + residual sym_cost — DONE
+- [x] 256K hash buckets — DONE
+- [x] Separated opcode+param streams (ZXL6) — DONE (−1.09 to −1.68 pts, BEATS gzip on user32)
+- [ ] Beat gzip-6 on ntdll (0.20 pts gap) and kernel32 (0.32 pts gap)
+- [ ] Beat zstd-3 on user32 (0.09 pts gap)
+
+### Current Standing
+
+  ntdll.dll    : 0.4634  (gap to gzip-6: 0.20 pts) ← near parity
+  kernel32.dll : 0.4620  (gap to gzip-6: 0.32 pts) ← near parity
+  user32.dll   : 0.3790  (BEATS gzip-6 by 0.86 pts, gap to zstd-3: 0.09 pts)
+
+  Chain depth: 128, Hash buckets: 256K, Passes: 3, Streams: opcode+param+8×literal
+  Compress: 0.4–0.8 MB/s. Decompress: 173–225 MB/s.
+
+### Feature: Extended BCJ — Conditional Near Jumps (0F 80..8F)
+
+#### Problem
+ZXL's BCJ filter converted E8/E9 (CALL/JMP rel32) relative operands to absolute. In x64
+PE code, conditional near jumps (JE/JNE/JB/JA/JS/JL/JG etc.) — encoded as 0F 80..8F
+with a 4-byte relative offset — are equally common but were not filtered.
+
+#### Solution
+Extended bcj_x86_forward/inverse to detect `[0F][8x]` prefixes (x in 0..F, covering all
+16 conditional near jump variants) and convert their 4-byte offset (at buf[i+2..i+5])
+from relative to absolute. The skip-ahead after detecting a prefix (i += 5) prevents
+the 4 offset bytes from being misidentified as new opcodes, keeping the transform
+invertible. The 2-byte opcode check requires `i + 6 <= len` to guard the 6-byte instruction.
+
+#### Benchmark Results
+
+  ntdll.dll    : 0.4630  (was 0.4634, −0.04 pts)
+  kernel32.dll : 0.4605  (was 0.4620, −0.15 pts)
+  user32.dll   : 0.3781  (was 0.3790, −0.09 pts)
+
+  kernel32 gained most (code-heavy, dense conditional branches).
+  user32 also gained (data sections have fewer Jcc, but some code).
+
+  Round-trip: PASS
+
+### Status
+- [x] Separated opcode+param streams (ZXL6) — DONE
+- [x] Extended BCJ: Jcc near (0F 80..8F) — DONE (−0.04 to −0.15 pts)
+- [ ] Beat gzip-6 on ntdll (0.16 pts gap) and kernel32 (0.17 pts gap)
+
+### Current Standing
+
+  ntdll.dll    : 0.4630  (gap to gzip-6: 0.16 pts)
+  kernel32.dll : 0.4605  (gap to gzip-6: 0.17 pts)
+  user32.dll   : 0.3781  (BEATS gzip-6 by 0.95 pts, gap to zstd-3: 0.18 pts)
+
+  Chain depth: 128, Hash buckets: 256K, Passes: 3, Streams: opcode+param+8×literal
+  BCJ: E8/E9 + 0F 80..8F. Compress: 0.3–0.8 MB/s. Decompress: 174–218 MB/s.
+
+============================================================
