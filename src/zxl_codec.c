@@ -324,12 +324,13 @@ static size_t compress_block(MatchCtx *ctx,
     Match   *match_arr3 = (Match *)   malloc(block_len * sizeof(Match));
     Match   *rep_match  = (Match *)   calloc(block_len,  sizeof(Match));
     uint8_t *found_arr  = (uint8_t *) malloc(block_len);
-    float   *dp         = (float *)   malloc((block_len + 1) * sizeof(float));
-    uint8_t *choice     = (uint8_t *) malloc(block_len);
+    float    *dp         = (float *)   malloc((block_len + 1) * sizeof(float));
+    uint8_t  *choice     = (uint8_t *) malloc(block_len);
+    uint32_t *choice_len = (uint32_t *)malloc(block_len * sizeof(uint32_t));
 
-    if (!match_arr || !match_arr2 || !match_arr3 || !rep_match || !found_arr || !dp || !choice) {
+    if (!match_arr || !match_arr2 || !match_arr3 || !rep_match || !found_arr || !dp || !choice || !choice_len) {
         free(match_arr); free(match_arr2); free(match_arr3); free(rep_match);
-        free(found_arr); free(dp); free(choice);
+        free(found_arr); free(dp); free(choice); free(choice_len);
         free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
         return 0;
     }
@@ -432,58 +433,79 @@ static size_t compress_block(MatchCtx *ctx,
         opcode_len = 0; off_len = 0; delta_len = 0; lbuf_size = 0; lit_len = 0; lit_run = 0;
 
         /* DP backward.
-         * choice[u]: 0=literal, 1=match_arr[u] (best), 2=match_arr2[u] (shortest),
-         *            3=rep_match[u] (REP), 4=match_arr3[u] (best small-offset) */
+         * choice[u]: 0=literal, 1=match_arr[u], 2=match_arr2[u],
+         *            3=rep_match[u] (REP), 4=match_arr3[u] (best small-offset)
+         * choice_len[u]: actual length to use (may be shorter than match's full length).
+         *
+         * For each match candidate, we try multiple lengths:
+         *   - full length
+         *   - ZXL_MIN_MATCH (shortest possible)
+         *   - length at encoding boundary (259 = 255+MIN_MATCH, 1B vs 2B length)
+         *   - a few intermediate lengths
+         * This lets the DP discover "short match here + better match after" patterns. */
         dp[block_len] = 0.0f;
         for (int32_t i = (int32_t)block_len - 1; i >= 0; i--) {
             uint32_t u = (uint32_t)i;
             dp[u]     = sym_cost[src[block_start + u]] + dp[u + 1];
             choice[u] = 0;
-            if (found_arr[u] >= 1) {
-                const Match *_m = &match_arr[u];
-                uint32_t lm  = _m->length - ZXL_MIN_MATCH;
-                float    ovhd;
-                if (_m->mtype == MTYPE_EXACT) {
-                    if      (lm < 256u && _m->offset <   256u) ovhd = ovhd_exact1;
-                    else if (lm < 256u && _m->offset < 65536u) ovhd = ovhd_exact2;
-                    else                                         ovhd = ovhd_exact;
-                } else {
-                    if      (lm < 256u && _m->offset <   256u) ovhd = ovhd_delta1;
-                    else if (lm < 256u && _m->offset < 65536u) ovhd = ovhd_delta2;
-                    else                                         ovhd = ovhd_delta;
-                }
-                float dp_match = ovhd + dp[u + _m->length];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 1; }
+            choice_len[u] = 0;
+
+            /* Helper macro: try a match candidate at a specific length.
+             * Updates dp[u], choice[u], choice_len[u] if this is cheaper. */
+            #define TRY_MATCH_LEN(cand_id, _m, try_len) do { \
+                uint32_t _tl = (try_len); \
+                if (_tl >= ZXL_MIN_MATCH && _tl <= (_m)->length && u + _tl <= (uint32_t)block_len) { \
+                    uint32_t _lm = _tl - ZXL_MIN_MATCH; \
+                    float _ovhd; \
+                    if ((_m)->mtype == MTYPE_EXACT) { \
+                        if      (_lm < 256u && (_m)->offset <   256u) _ovhd = ovhd_exact1; \
+                        else if (_lm < 256u && (_m)->offset < 65536u) _ovhd = ovhd_exact2; \
+                        else                                           _ovhd = ovhd_exact; \
+                    } else { \
+                        if      (_lm < 256u && (_m)->offset <   256u) _ovhd = ovhd_delta1; \
+                        else if (_lm < 256u && (_m)->offset < 65536u) _ovhd = ovhd_delta2; \
+                        else                                           _ovhd = ovhd_delta; \
+                    } \
+                    float _dp_m = _ovhd + dp[u + _tl]; \
+                    if (_dp_m < dp[u]) { dp[u] = _dp_m; choice[u] = (cand_id); choice_len[u] = _tl; } \
+                } \
+            } while (0)
+
+            /* Try each match candidate at multiple lengths */
+            for (int _ci = 0; _ci < (int)found_arr[u]; _ci++) {
+                const Match *_m = (_ci == 0) ? &match_arr[u] :
+                                  (_ci == 1) ? &match_arr2[u] : &match_arr3[u];
+                uint8_t cid = (_ci == 0) ? 1 : (_ci == 1) ? 2 : 4;
+                uint32_t mlen = _m->length;
+                /* Full length */
+                TRY_MATCH_LEN(cid, _m, mlen);
+                /* Min match length */
+                if (mlen > ZXL_MIN_MATCH)
+                    TRY_MATCH_LEN(cid, _m, ZXL_MIN_MATCH);
+                /* At encoding boundary: 259 = 255 + 4 (1B->2B length transition) */
+                if (mlen > 259u)
+                    TRY_MATCH_LEN(cid, _m, 259u);
+                /* A few intermediate lengths for long matches */
+                if (mlen > 8)
+                    TRY_MATCH_LEN(cid, _m, 8u);
+                if (mlen > 16)
+                    TRY_MATCH_LEN(cid, _m, 16u);
+                if (mlen > 32)
+                    TRY_MATCH_LEN(cid, _m, 32u);
+                if (mlen > 64)
+                    TRY_MATCH_LEN(cid, _m, 64u);
             }
-            /* Second candidate: shortest match — may open a longer match after */
-            if (found_arr[u] >= 2) {
-                const Match *_m = &match_arr2[u];
-                uint32_t lm  = _m->length - ZXL_MIN_MATCH;
-                float    ovhd;
-                if (_m->mtype == MTYPE_EXACT) {
-                    if      (lm < 256u && _m->offset <   256u) ovhd = ovhd_exact1;
-                    else if (lm < 256u && _m->offset < 65536u) ovhd = ovhd_exact2;
-                    else                                         ovhd = ovhd_exact;
-                } else {
-                    if      (lm < 256u && _m->offset <   256u) ovhd = ovhd_delta1;
-                    else if (lm < 256u && _m->offset < 65536u) ovhd = ovhd_delta2;
-                    else                                         ovhd = ovhd_delta;
-                }
-                float dp_match = ovhd + dp[u + _m->length];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 2; }
-            }
-            /* REP candidate: pre-pass estimated this offset is in rep[] cache */
+            #undef TRY_MATCH_LEN
+
+            /* REP candidate: try full length and MIN_MATCH */
             if (rep_match[u].length > 0) {
-                float dp_match = ovhd_rep + dp[u + rep_match[u].length];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 3; }
-            }
-            /* Third candidate: best small-offset match (EXACT1/DELTA1 class).
-             * By construction off<256 and lm<256, so overhead is always exact1/delta1. */
-            if (found_arr[u] >= 3) {
-                const Match *_m = &match_arr3[u];
-                float ovhd = (_m->mtype == MTYPE_EXACT) ? ovhd_exact1 : ovhd_delta1;
-                float dp_match = ovhd + dp[u + _m->length];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 4; }
+                uint32_t rlen = rep_match[u].length;
+                float dp_match = ovhd_rep + dp[u + rlen];
+                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 3; choice_len[u] = rlen; }
+                if (rlen > ZXL_MIN_MATCH) {
+                    float dp_short = ovhd_rep + dp[u + ZXL_MIN_MATCH];
+                    if (dp_short < dp[u]) { dp[u] = dp_short; choice[u] = 3; choice_len[u] = ZXL_MIN_MATCH; }
+                }
             }
         }
 
@@ -508,10 +530,11 @@ static size_t compress_block(MatchCtx *ctx,
                     Match *m = (ch == 1) ? &match_arr[i] :
                                (ch == 2) ? &match_arr2[i] :
                                (ch == 4) ? &match_arr3[i] : &rep_match[i];
+                    uint32_t use_len = choice_len[i];
                     FLUSH_LITS();
                     uint32_t ref_base = (uint32_t)(block_start + i) - m->offset;
-                    uint8_t  ref_last = src[ref_base + m->length - 1];
-                    uint32_t lm = m->length - ZXL_MIN_MATCH;
+                    uint8_t  ref_last = src[ref_base + use_len - 1];
+                    uint32_t lm = use_len - ZXL_MIN_MATCH;
                     if (m->mtype == MTYPE_EXACT) {
                         int ri = (m->offset == rep[0]) ? 0 :
                                  (m->offset == rep[1]) ? 1 :
@@ -576,7 +599,7 @@ static size_t compress_block(MatchCtx *ctx,
                                    ? (ref_last ^ m->delta)
                                    : (uint8_t)(ref_last + m->delta);
                     }
-                    i += m->length;
+                    i += use_len;
                 }
             }
         }
@@ -683,9 +706,9 @@ static size_t compress_block(MatchCtx *ctx,
     }
 
     free(match_arr); free(match_arr2); free(match_arr3); free(rep_match);
-    free(found_arr); free(dp); free(choice);
+    free(found_arr); free(dp); free(choice); free(choice_len);
     match_arr = NULL; match_arr2 = NULL; match_arr3 = NULL; rep_match = NULL;
-    found_arr = NULL; choice = NULL;
+    found_arr = NULL; choice = NULL; choice_len = NULL;
 
     #undef FLUSH_LITS
 

@@ -15,8 +15,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define RANS_SCALE_BITS 12
-#define RANS_SCALE      (1u << RANS_SCALE_BITS)   /* 4096 */
+#define RANS_SCALE_BITS 14
+#define RANS_SCALE      (1u << RANS_SCALE_BITS)   /* 16384 */
 #define RANS_L          (1u << 23)                 /* lower bound of state */
 
 /* Per-symbol encode info */
