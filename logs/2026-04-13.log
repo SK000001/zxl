@@ -1,0 +1,35 @@
+ZXL Optimization Log - 2026-04-13
+===================================
+
+Session goal: Push ZXL compression ratios beyond zstd-9 level
+
+Baseline (start of session):
+  ntdll.dll:   0.4440 (1119706 / 2522008)
+  kernel32.dll: 0.4421 (369624 / 836152)
+  user32.dll:  0.3646 (682959 / 1873304)
+
+Comparison:
+  gzip-6:   ntdll 0.4614, kernel32 ~0.44, user32 ~0.37
+  zstd-9:   ntdll 0.4442, kernel32 ~0.44, user32 ~0.37
+  bzip2-9:  ntdll 0.4346
+
+--- Phase A: Enhanced Match Finding ---
+
+Change 1: Increased hash chain depth 256 -> 1024
+  - More candidates examined per position
+  - Finds better matches at cost of compression speed
+
+Change 2: Expanded match candidates from 3 to 5 per position
+  - Added: best mid-offset match (256<=off<65536)
+  - Added: longest match of any type
+  - DP optimal parser now has more options at each position
+  - match_find returns up to ZXL_MAX_CANDIDATES=5 distinct matches
+  - Flat match_all array replaces separate match_arr/match_arr2/match_arr3
+
+Results after Phase A:
+  ntdll.dll:   0.4440 -> 0.4418 (-0.0022)  1114133 bytes
+  kernel32.dll: 0.4421 -> 0.4409 (-0.0012)  368693 bytes
+  user32.dll:  0.3646 -> 0.3637 (-0.0009)  681390 bytes
+
+Compression speed: ~0.1-0.2 MB/s (slower due to deeper chains, acceptable for max compression)
+Decompression speed: unchanged ~120-140 MB/s

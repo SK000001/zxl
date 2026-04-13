@@ -26,7 +26,7 @@
 #define ZXL_HASH_SIZE   (1u << ZXL_HASH_BITS)   /* 512 K buckets         */
 #define ZXL_HASH_MASK   (ZXL_HASH_SIZE - 1u)
 
-#define ZXL_CHAIN_DEPTH 256         /* candidates checked per chain per match type */
+#define ZXL_CHAIN_DEPTH 1024        /* candidates checked per chain per match type */
 #define ZXL_WINDOW      (1u << 21)  /* sliding window: 2 MB                       */
 
 #define ZXL_MIN_MATCH   4
@@ -90,19 +90,18 @@ static inline int32_t match_savings(uint32_t length, uint8_t mtype)
 void match_ctx_init(MatchCtx *ctx);
 
 /*
- * Find up to 3 matches at src[pos]:
+ * Find up to 5 matches at src[pos]:
  *   out[0] = best-savings match (highest estimated bit savings)
  *   out[1] = shortest viable match (fewest bytes, if different from out[0])
  *   out[2] = best small-offset match (off<256 && lm<256, fits EXACT1/DELTA1)
- *            — only included when distinct from out[0] and out[1].
- * Returns 0 (none), 1, 2, or 3 (three distinct matches).
- * Having the shortest match lets the DP consider "short here → long after".
- * Having the best small-offset match lets the DP pick cheap EXACT1/DELTA1
- * even when the global best is a large-offset EXACT2/EXACT match.
+ *   out[3] = best mid-offset match (256<=off<65536, fits EXACT2/DELTA2)
+ *   out[4] = longest match of any type
+ * Returns 0..5 (number of distinct matches found).
  */
+#define ZXL_MAX_CANDIDATES 5
 int match_find(MatchCtx *ctx,
                const uint8_t *src, size_t src_len,
-               uint32_t pos, Match out[3]);
+               uint32_t pos, Match out[ZXL_MAX_CANDIDATES]);
 
 /* Insert position pos into all three chains. */
 void match_update(MatchCtx *ctx, const uint8_t *src, uint32_t pos);

@@ -217,6 +217,23 @@ do {                                                                       \
                     best_e1.mtype    = (MTYPE);                             \
                     best_e1.delta    = _delta;                              \
                 }                                                           \
+                /* Track best mid-offset match (fits EXACT2/DELTA2 class) */ \
+                if (_sav > 0 && _off >= 256u && _off < 65536u &&           \
+                    (_len - ZXL_MIN_MATCH) < 256u &&                       \
+                    _sav > best_e2_savings) {                               \
+                    best_e2_savings  = _sav;                                \
+                    best_e2.offset   = _off;                                \
+                    best_e2.length   = _len;                                \
+                    best_e2.mtype    = (MTYPE);                             \
+                    best_e2.delta    = _delta;                              \
+                }                                                           \
+                /* Track longest match of any type */                       \
+                if (_sav > 0 && _len > longest.length) {                   \
+                    longest.offset   = _off;                                \
+                    longest.length   = _len;                                \
+                    longest.mtype    = (MTYPE);                             \
+                    longest.delta    = _delta;                              \
+                }                                                           \
                 if (_len == max_len) break;                                 \
             }                                                               \
         }                                                                   \
@@ -234,7 +251,7 @@ static inline uint32_t extend_exact_wrap(const uint8_t *a, const uint8_t *b,
 
 int match_find(MatchCtx *ctx,
                const uint8_t *src, size_t src_len,
-               uint32_t pos, Match out[3])
+               uint32_t pos, Match out[ZXL_MAX_CANDIDATES])
 {
     if (pos + ZXL_MIN_MATCH > src_len) return 0;
 
@@ -251,11 +268,19 @@ int match_find(MatchCtx *ctx,
     Match   short_best;
     short_best.length = 0;
 
-    /* Best small-offset match (off<256, lm<256): fits EXACT1/DELTA1 class.
-     * The DP can choose this when the global best is a high-overhead EXACT2/EXACT. */
+    /* Best small-offset match (off<256, lm<256): fits EXACT1/DELTA1 class */
     int32_t best_e1_savings = 0;
     Match   best_e1;
     best_e1.length = 0;
+
+    /* Best mid-offset match (256<=off<65536, lm<256): fits EXACT2/DELTA2 */
+    int32_t best_e2_savings = 0;
+    Match   best_e2;
+    best_e2.length = 0;
+
+    /* Longest match of any type */
+    Match   longest;
+    longest.length = 0;
 
     /* --- 1. Exact chain -------------------------------------------- */
     WALK_CHAIN(ctx->exact_ht[hash_exact(cur)], ctx->exact_next,
@@ -275,20 +300,23 @@ int match_find(MatchCtx *ctx,
     out[0] = best;
     int n = 1;
 
-    /* Second candidate: shortest viable match (different length from best). */
-    if (short_best.length > 0 && short_best.length != best.length) {
-        out[n++] = short_best;
-    }
+    /* Helper: check if match is duplicate of existing candidates */
+    #define CHECK_AND_ADD(cand) do { \
+        if ((cand).length > 0) { \
+            int _dup = 0; \
+            for (int _k = 0; _k < n; _k++) \
+                if ((cand).offset == out[_k].offset && (cand).length == out[_k].length) \
+                    { _dup = 1; break; } \
+            if (!_dup) out[n++] = (cand); \
+        } \
+    } while (0)
 
-    /* Third candidate: best small-offset match (off<256, lm<256).
-     * Include only when it is not already covered by out[0] or out[1].
-     * Two candidates at the same (offset, length) yield identical DP choices. */
-    if (best_e1.length > 0) {
-        int dup = (best_e1.offset == out[0].offset && best_e1.length == out[0].length);
-        if (!dup && n >= 2)
-            dup = (best_e1.offset == out[1].offset && best_e1.length == out[1].length);
-        if (!dup) out[n++] = best_e1;
-    }
+    CHECK_AND_ADD(short_best);
+    CHECK_AND_ADD(best_e1);
+    CHECK_AND_ADD(best_e2);
+    CHECK_AND_ADD(longest);
+
+    #undef CHECK_AND_ADD
 
     return n;
 }

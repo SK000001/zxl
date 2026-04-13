@@ -319,37 +319,32 @@ static size_t compress_block(MatchCtx *ctx,
      *
      * Forward trace: walk from i=0, emitting the DP-chosen parse.
      */
-    Match   *match_arr  = (Match *)   malloc(block_len * sizeof(Match));
-    Match   *match_arr2 = (Match *)   malloc(block_len * sizeof(Match));
-    Match   *match_arr3 = (Match *)   malloc(block_len * sizeof(Match));
+    /* match_all: flat array of ZXL_MAX_CANDIDATES matches per position.
+     * match_all[i * ZXL_MAX_CANDIDATES + c] = candidate c at position i. */
+    Match   *match_all  = (Match *)   malloc(block_len * ZXL_MAX_CANDIDATES * sizeof(Match));
     Match   *rep_match  = (Match *)   calloc(block_len,  sizeof(Match));
     uint8_t *found_arr  = (uint8_t *) malloc(block_len);
     float    *dp         = (float *)   malloc((block_len + 1) * sizeof(float));
     uint8_t  *choice     = (uint8_t *) malloc(block_len);
     uint32_t *choice_len = (uint32_t *)malloc(block_len * sizeof(uint32_t));
 
-    if (!match_arr || !match_arr2 || !match_arr3 || !rep_match || !found_arr || !dp || !choice || !choice_len) {
-        free(match_arr); free(match_arr2); free(match_arr3); free(rep_match);
+    if (!match_all || !rep_match || !found_arr || !dp || !choice || !choice_len) {
+        free(match_all); free(rep_match);
         free(found_arr); free(dp); free(choice); free(choice_len);
         free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
         return 0;
     }
 
-    /* Forward pass: find up to 3 matches per position.
-     * found_arr[i] = 0 (none), 1, 2, or 3.
-     * match_arr[i]  = best-savings match
-     * match_arr2[i] = shortest viable match (if found_arr[i]>=2)
-     * match_arr3[i] = best small-offset match (off<256, lm<256) (if found_arr[i]==3) */
+    /* Forward pass: find up to ZXL_MAX_CANDIDATES matches per position. */
     for (uint32_t i = 0; i < (uint32_t)block_len; i++) {
         uint32_t p = (uint32_t)block_start + i;
         if (p + ZXL_MIN_MATCH <= end_pos) {
             match_update(ctx, src, p);
-            Match tmp[3];
+            Match tmp[ZXL_MAX_CANDIDATES];
             int n = match_find(ctx, src, (size_t)end_pos, p, tmp);
             found_arr[i] = (uint8_t)n;
-            if (n >= 1) match_arr[i]  = tmp[0];
-            if (n >= 2) match_arr2[i] = tmp[1];
-            if (n >= 3) match_arr3[i] = tmp[2];
+            for (int c = 0; c < n; c++)
+                match_all[i * ZXL_MAX_CANDIDATES + c] = tmp[c];
         } else {
             found_arr[i] = 0;
         }
@@ -371,7 +366,7 @@ static size_t compress_block(MatchCtx *ctx,
         while (i < (uint32_t)block_len) {
             /* Check all candidates for a REP-eligible match at this position */
             for (int c = 0; c < (int)found_arr[i]; c++) {
-                Match *m = (c == 0) ? &match_arr[i] : (c == 1) ? &match_arr2[i] : &match_arr3[i];
+                Match *m = &match_all[i * ZXL_MAX_CANDIDATES + c];
                 if (m->mtype == MTYPE_EXACT && m->length - ZXL_MIN_MATCH < 256u) {
                     int ri = (m->offset == rep[0]) ? 0 :
                              (m->offset == rep[1]) ? 1 :
@@ -386,8 +381,9 @@ static size_t compress_block(MatchCtx *ctx,
             }
             /* Advance: greedy — take best match if it saves bits, else literal */
             if (found_arr[i] >= 1 &&
-                match_savings(match_arr[i].length, match_arr[i].mtype) > 0) {
-                Match *m = &match_arr[i];
+                match_savings(match_all[i * ZXL_MAX_CANDIDATES].length,
+                              match_all[i * ZXL_MAX_CANDIDATES].mtype) > 0) {
+                Match *m = &match_all[i * ZXL_MAX_CANDIDATES];
                 if (m->mtype == MTYPE_EXACT) {
                     int ri = (m->offset == rep[0]) ? 0 :
                              (m->offset == rep[1]) ? 1 :
@@ -433,8 +429,8 @@ static size_t compress_block(MatchCtx *ctx,
         opcode_len = 0; off_len = 0; delta_len = 0; lbuf_size = 0; lit_len = 0; lit_run = 0;
 
         /* DP backward.
-         * choice[u]: 0=literal, 1=match_arr[u], 2=match_arr2[u],
-         *            3=rep_match[u] (REP), 4=match_arr3[u] (best small-offset)
+         * choice[u]: 0=literal, 1..ZXL_MAX_CANDIDATES=match candidate,
+         *            CHOICE_REP=rep_match[u]
          * choice_len[u]: actual length to use (may be shorter than match's full length).
          *
          * For each match candidate, we try multiple lengths:
@@ -471,11 +467,12 @@ static size_t compress_block(MatchCtx *ctx,
                 } \
             } while (0)
 
-            /* Try each match candidate at multiple lengths */
+            /* Try each match candidate at multiple lengths.
+             * choice values: 0=literal, 1..ZXL_MAX_CANDIDATES=match candidate,
+             *                ZXL_MAX_CANDIDATES+1=REP */
             for (int _ci = 0; _ci < (int)found_arr[u]; _ci++) {
-                const Match *_m = (_ci == 0) ? &match_arr[u] :
-                                  (_ci == 1) ? &match_arr2[u] : &match_arr3[u];
-                uint8_t cid = (_ci == 0) ? 1 : (_ci == 1) ? 2 : 4;
+                const Match *_m = &match_all[u * ZXL_MAX_CANDIDATES + _ci];
+                uint8_t cid = (uint8_t)(_ci + 1);
                 uint32_t mlen = _m->length;
                 /* Full length */
                 TRY_MATCH_LEN(cid, _m, mlen);
@@ -498,13 +495,14 @@ static size_t compress_block(MatchCtx *ctx,
             #undef TRY_MATCH_LEN
 
             /* REP candidate: try full length and MIN_MATCH */
+            #define CHOICE_REP (ZXL_MAX_CANDIDATES + 1)
             if (rep_match[u].length > 0) {
                 uint32_t rlen = rep_match[u].length;
                 float dp_match = ovhd_rep + dp[u + rlen];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = 3; choice_len[u] = rlen; }
+                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = CHOICE_REP; choice_len[u] = rlen; }
                 if (rlen > ZXL_MIN_MATCH) {
                     float dp_short = ovhd_rep + dp[u + ZXL_MIN_MATCH];
-                    if (dp_short < dp[u]) { dp[u] = dp_short; choice[u] = 3; choice_len[u] = ZXL_MIN_MATCH; }
+                    if (dp_short < dp[u]) { dp[u] = dp_short; choice[u] = CHOICE_REP; choice_len[u] = ZXL_MIN_MATCH; }
                 }
             }
         }
@@ -527,9 +525,8 @@ static size_t compress_block(MatchCtx *ctx,
                     if (lit_run == 245) FLUSH_LITS();
                     i++;
                 } else {
-                    Match *m = (ch == 1) ? &match_arr[i] :
-                               (ch == 2) ? &match_arr2[i] :
-                               (ch == 4) ? &match_arr3[i] : &rep_match[i];
+                    Match *m = (ch == CHOICE_REP) ? &rep_match[i]
+                               : &match_all[i * ZXL_MAX_CANDIDATES + (ch - 1)];
                     uint32_t use_len = choice_len[i];
                     FLUSH_LITS();
                     uint32_t ref_base = (uint32_t)(block_start + i) - m->offset;
@@ -705,10 +702,11 @@ static size_t compress_block(MatchCtx *ctx,
         }
     }
 
-    free(match_arr); free(match_arr2); free(match_arr3); free(rep_match);
+    free(match_all); free(rep_match);
     free(found_arr); free(dp); free(choice); free(choice_len);
-    match_arr = NULL; match_arr2 = NULL; match_arr3 = NULL; rep_match = NULL;
+    match_all = NULL; rep_match = NULL;
     found_arr = NULL; choice = NULL; choice_len = NULL;
+    #undef CHOICE_REP
 
     #undef FLUSH_LITS
 
