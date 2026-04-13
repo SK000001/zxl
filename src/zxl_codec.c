@@ -479,18 +479,31 @@ static size_t compress_block(MatchCtx *ctx,
                 /* Min match length */
                 if (mlen > ZXL_MIN_MATCH)
                     TRY_MATCH_LEN(cid, _m, ZXL_MIN_MATCH);
+                /* Short intermediates */
+                if (mlen > 5)
+                    TRY_MATCH_LEN(cid, _m, 5u);
+                if (mlen > 6)
+                    TRY_MATCH_LEN(cid, _m, 6u);
                 /* At encoding boundary: 259 = 255 + 4 (1B->2B length transition) */
                 if (mlen > 259u)
                     TRY_MATCH_LEN(cid, _m, 259u);
-                /* A few intermediate lengths for long matches */
+                /* Intermediate lengths for longer matches */
                 if (mlen > 8)
                     TRY_MATCH_LEN(cid, _m, 8u);
+                if (mlen > 12)
+                    TRY_MATCH_LEN(cid, _m, 12u);
                 if (mlen > 16)
                     TRY_MATCH_LEN(cid, _m, 16u);
+                if (mlen > 24)
+                    TRY_MATCH_LEN(cid, _m, 24u);
                 if (mlen > 32)
                     TRY_MATCH_LEN(cid, _m, 32u);
+                if (mlen > 48)
+                    TRY_MATCH_LEN(cid, _m, 48u);
                 if (mlen > 64)
                     TRY_MATCH_LEN(cid, _m, 64u);
+                if (mlen > 128)
+                    TRY_MATCH_LEN(cid, _m, 128u);
             }
             #undef TRY_MATCH_LEN
 
