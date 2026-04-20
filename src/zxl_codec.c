@@ -56,6 +56,7 @@
 
 /* File-level flags stored in the 4-byte flags field of the header */
 #define ZXL_FLAG_BCJ   0x01u  /* x86 BCJ (E8/E9) filter was applied */
+#define ZXL_FLAG_BCJ64 0x02u  /* x64 RIP-relative BCJ filter was applied */
 
 /*
  * Token byte values (ZXLB):
@@ -90,6 +91,216 @@
 #define TOK_EXACT   0xFEu
 #define TOK_DELTA   0xFFu
 #define N_REP       5     /* LRU REP cache size */
+
+/* ------------------------------------------------------------------ */
+/* x64 RIP-relative BCJ filter                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * x64 RIP-relative filter: convert RIP-relative displacements to absolute.
+ *
+ * In 64-bit code, data references use RIP-relative addressing:
+ *   MOV reg, [RIP+disp32]  /  LEA reg, [RIP+disp32]  /  CMP [RIP+disp32], imm
+ *
+ * The key is the ModRM byte: when (modrm & 0xC7) == 0x05, the instruction
+ * uses [RIP+disp32] addressing. The disp32 starts right after the ModRM byte
+ * (possibly after a SIB byte, but RIP-relative never has SIB).
+ *
+ * We handle the most common patterns:
+ *   1. REX.W (0x48..0x4F) + opcode + ModRM  (2-byte prefix before disp32)
+ *      Opcodes: 0x8B (MOV r,m), 0x8D (LEA r,m), 0x89 (MOV m,r), 0x3B (CMP r,m),
+ *               0x39 (CMP m,r), 0x03 (ADD r,m), 0x01 (ADD m,r), 0x2B (SUB r,m),
+ *               0x33 (XOR r,m), 0x31 (XOR m,r), 0x0B (OR r,m), 0x23 (AND r,m),
+ *               0x85 (TEST r,m), 0x63 (MOVSXD r,m)
+ *   2. Non-REX: opcode + ModRM with (modrm & 0xC7)==0x05
+ *      Same opcodes without REX prefix (32-bit operand size in 64-bit mode)
+ *   3. 0x0F + 2-byte opcode + ModRM: SSE/AVX instructions
+ *      0x0F 0x10/0x11 (MOVUPS), 0x0F 0x28/0x29 (MOVAPS),
+ *      0x0F 0x6F/0x7F (MOVDQA/MOVDQU with 66 prefix)
+ *
+ * The disp32 is at offset [prefix_len + 1(opcode) + 1(modrm)] from start,
+ * or [prefix_len + 2(opcode) + 1(modrm)] for 0F-prefixed opcodes.
+ * IP points to the next instruction = pos + total_insn_len.
+ */
+
+/* Check if a byte is a common opcode that uses ModRM with memory operand */
+static inline int is_rip_opcode(uint8_t op)
+{
+    switch (op) {
+        case 0x8B: case 0x8D: case 0x89: case 0x3B: case 0x39:
+        case 0x03: case 0x01: case 0x2B: case 0x33: case 0x31:
+        case 0x0B: case 0x23: case 0x85: case 0x63:
+        case 0x29: /* SUB m,r */
+        case 0x83: /* immediate group: CMP/ADD/SUB [rip+disp32], imm8 */
+        case 0xC7: /* MOV [rip+disp32], imm32 */
+        case 0xF7: /* TEST/NOT/NEG/MUL/DIV [rip+disp32] */
+            return 1;
+        default: return 0;
+    }
+}
+
+static void bcj_x64_forward(uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i + 7 <= len; ) {
+        uint8_t b0 = buf[i];
+        int has_rex = (b0 >= 0x40 && b0 <= 0x4F);  /* any REX prefix */
+        int has_66  = (b0 == 0x66);                 /* operand size override */
+        int prefix_len = (has_rex || has_66) ? 1 : 0;
+        size_t op_pos = i + prefix_len;
+
+        if (op_pos + 6 > len) { i++; continue; }
+
+        uint8_t op = buf[op_pos];
+
+        /* Case 1: regular opcode + ModRM */
+        if (is_rip_opcode(op)) {
+            uint8_t modrm = buf[op_pos + 1];
+            if ((modrm & 0xC7) == 0x05) {
+                /* disp32 starts at op_pos + 2 */
+                size_t disp_pos = op_pos + 2;
+                /* Determine instruction length to compute RIP value.
+                 * For most opcodes: insn = prefix + opcode(1) + modrm(1) + disp32(4) = prefix+6
+                 * For 0x83: + imm8 = prefix+7
+                 * For 0xC7: + imm32 = prefix+10 (but we only need next-IP for the transform)
+                 * For 0xF7: depends on reg field, but commonly +imm32 for TEST */
+                uint32_t next_ip;
+                if (op == 0x83) {
+                    if (disp_pos + 5 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 5); /* disp32 + imm8 */
+                } else if (op == 0xC7) {
+                    if (disp_pos + 8 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 8); /* disp32 + imm32 */
+                } else {
+                    if (disp_pos + 4 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 4); /* disp32 only */
+                }
+                uint32_t rel = (uint32_t)buf[disp_pos]
+                             | ((uint32_t)buf[disp_pos+1] << 8)
+                             | ((uint32_t)buf[disp_pos+2] << 16)
+                             | ((uint32_t)buf[disp_pos+3] << 24);
+                uint32_t abs_addr = rel + next_ip;
+                buf[disp_pos]   = (uint8_t)(abs_addr);
+                buf[disp_pos+1] = (uint8_t)(abs_addr >> 8);
+                buf[disp_pos+2] = (uint8_t)(abs_addr >> 16);
+                buf[disp_pos+3] = (uint8_t)(abs_addr >> 24);
+                i = disp_pos + 4; /* skip past disp32 */
+                continue;
+            }
+        }
+
+        /* Case 2: 0F-prefixed opcodes (SSE/conditional moves) */
+        if (op == 0x0F && op_pos + 7 <= len) {
+            uint8_t op2 = buf[op_pos + 1];
+            /* MOVUPS/MOVAPS/MOVDQA and similar SSE with memory operand */
+            int is_sse_mem = (op2 == 0x10 || op2 == 0x11 ||  /* MOVUPS */
+                              op2 == 0x28 || op2 == 0x29 ||  /* MOVAPS */
+                              op2 == 0x6F || op2 == 0x7F ||  /* MOVDQ* */
+                              op2 == 0x6E || op2 == 0x7E ||  /* MOVD/MOVQ */
+                              op2 == 0x2E || op2 == 0x2F ||  /* UCOMISD/COMISD */
+                              op2 == 0xB6 || op2 == 0xB7 ||  /* MOVZX */
+                              op2 == 0xBE || op2 == 0xBF ||  /* MOVSX */
+                              (op2 >= 0x40 && op2 <= 0x4F)); /* CMOVcc */
+            if (is_sse_mem) {
+                uint8_t modrm = buf[op_pos + 2];
+                if ((modrm & 0xC7) == 0x05) {
+                    size_t disp_pos = op_pos + 3;
+                    if (disp_pos + 4 > len) { i++; continue; }
+                    uint32_t next_ip = (uint32_t)(disp_pos + 4);
+                    uint32_t rel = (uint32_t)buf[disp_pos]
+                                 | ((uint32_t)buf[disp_pos+1] << 8)
+                                 | ((uint32_t)buf[disp_pos+2] << 16)
+                                 | ((uint32_t)buf[disp_pos+3] << 24);
+                    uint32_t abs_addr = rel + next_ip;
+                    buf[disp_pos]   = (uint8_t)(abs_addr);
+                    buf[disp_pos+1] = (uint8_t)(abs_addr >> 8);
+                    buf[disp_pos+2] = (uint8_t)(abs_addr >> 16);
+                    buf[disp_pos+3] = (uint8_t)(abs_addr >> 24);
+                    i = disp_pos + 4;
+                    continue;
+                }
+            }
+        }
+
+        i++;
+    }
+}
+
+static void bcj_x64_inverse(uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i + 7 <= len; ) {
+        uint8_t b0 = buf[i];
+        int has_rex = (b0 >= 0x40 && b0 <= 0x4F);
+        int has_66  = (b0 == 0x66);
+        int prefix_len = (has_rex || has_66) ? 1 : 0;
+        size_t op_pos = i + prefix_len;
+
+        if (op_pos + 6 > len) { i++; continue; }
+
+        uint8_t op = buf[op_pos];
+
+        if (is_rip_opcode(op)) {
+            uint8_t modrm = buf[op_pos + 1];
+            if ((modrm & 0xC7) == 0x05) {
+                size_t disp_pos = op_pos + 2;
+                uint32_t next_ip;
+                if (op == 0x83) {
+                    if (disp_pos + 5 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 5);
+                } else if (op == 0xC7) {
+                    if (disp_pos + 8 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 8);
+                } else {
+                    if (disp_pos + 4 > len) { i++; continue; }
+                    next_ip = (uint32_t)(disp_pos + 4);
+                }
+                uint32_t abs_addr = (uint32_t)buf[disp_pos]
+                                  | ((uint32_t)buf[disp_pos+1] << 8)
+                                  | ((uint32_t)buf[disp_pos+2] << 16)
+                                  | ((uint32_t)buf[disp_pos+3] << 24);
+                uint32_t rel = abs_addr - next_ip;
+                buf[disp_pos]   = (uint8_t)(rel);
+                buf[disp_pos+1] = (uint8_t)(rel >> 8);
+                buf[disp_pos+2] = (uint8_t)(rel >> 16);
+                buf[disp_pos+3] = (uint8_t)(rel >> 24);
+                i = disp_pos + 4;
+                continue;
+            }
+        }
+
+        if (op == 0x0F && op_pos + 7 <= len) {
+            uint8_t op2 = buf[op_pos + 1];
+            int is_sse_mem = (op2 == 0x10 || op2 == 0x11 ||
+                              op2 == 0x28 || op2 == 0x29 ||
+                              op2 == 0x6F || op2 == 0x7F ||
+                              op2 == 0x6E || op2 == 0x7E ||
+                              op2 == 0x2E || op2 == 0x2F ||
+                              op2 == 0xB6 || op2 == 0xB7 ||
+                              op2 == 0xBE || op2 == 0xBF ||
+                              (op2 >= 0x40 && op2 <= 0x4F));
+            if (is_sse_mem) {
+                uint8_t modrm = buf[op_pos + 2];
+                if ((modrm & 0xC7) == 0x05) {
+                    size_t disp_pos = op_pos + 3;
+                    if (disp_pos + 4 > len) { i++; continue; }
+                    uint32_t next_ip = (uint32_t)(disp_pos + 4);
+                    uint32_t abs_addr = (uint32_t)buf[disp_pos]
+                                      | ((uint32_t)buf[disp_pos+1] << 8)
+                                      | ((uint32_t)buf[disp_pos+2] << 16)
+                                      | ((uint32_t)buf[disp_pos+3] << 24);
+                    uint32_t rel = abs_addr - next_ip;
+                    buf[disp_pos]   = (uint8_t)(rel);
+                    buf[disp_pos+1] = (uint8_t)(rel >> 8);
+                    buf[disp_pos+2] = (uint8_t)(rel >> 16);
+                    buf[disp_pos+3] = (uint8_t)(rel >> 24);
+                    i = disp_pos + 4;
+                    continue;
+                }
+            }
+        }
+
+        i++;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* BCJ (Branch Conversion Jump) x86 filter                           */
@@ -258,13 +469,14 @@ static size_t compress_block(MatchCtx *ctx,
      * Coding them independently allows each rANS model to fit its own distribution.
      */
     uint8_t *opcode_buf  = (uint8_t *)malloc(block_len + 64);
-    uint8_t *off_buf     = (uint8_t *)malloc(block_len * 3 + 64);  /* offset bytes only */
+    uint8_t *off_lo_buf  = (uint8_t *)malloc(block_len + 64);    /* offset low bytes  */
+    uint8_t *off_hi_buf  = (uint8_t *)malloc(block_len * 2 + 64); /* offset high+top bytes */
     uint8_t *delta_buf   = (uint8_t *)malloc(block_len * 2 + 64);  /* mtype+delta bytes only */
     uint8_t *lbuf        = (uint8_t *)malloc(block_len + 64);
     uint8_t *lit_buf     = (uint8_t *)malloc(block_len + 64);
     uint8_t *lit_ctx_buf = (uint8_t *)malloc(block_len + 8);
-    if (!opcode_buf || !off_buf || !delta_buf || !lbuf || !lit_buf || !lit_ctx_buf) {
-        free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
+    if (!opcode_buf || !off_lo_buf || !off_hi_buf || !delta_buf || !lbuf || !lit_buf || !lit_ctx_buf) {
+        free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
     }
 
     /* Build per-symbol entropy cost table and cumulative prefix sum.
@@ -283,8 +495,9 @@ static size_t compress_block(MatchCtx *ctx,
             sym_cost[_i] = -log2f((float)f / ftotal);
         }
     }
-    size_t opcode_len = 0;  /* bytes written to opcode_buf */
-    size_t off_len    = 0;  /* bytes written to off_buf (offset bytes only) */
+    size_t opcode_len  = 0;  /* bytes written to opcode_buf */
+    size_t off_lo_len  = 0;  /* low bytes of offsets  */
+    size_t off_hi_len  = 0;  /* high+top bytes of offsets */
     size_t delta_len  = 0;  /* bytes written to delta_buf (mtype + delta bytes only) */
     size_t lbuf_size  = 0;  /* bytes written to lbuf (match length bytes) */
     size_t lit_len = 0;
@@ -331,7 +544,7 @@ static size_t compress_block(MatchCtx *ctx,
     if (!match_all || !rep_match || !found_arr || !dp || !choice || !choice_len) {
         free(match_all); free(rep_match);
         free(found_arr); free(dp); free(choice); free(choice_len);
-        free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
+        free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
         return 0;
     }
 
@@ -426,7 +639,7 @@ static size_t compress_block(MatchCtx *ctx,
 
     for (int _pass = 0; _pass < 4; _pass++) {
         /* Reset output streams for this parse attempt */
-        opcode_len = 0; off_len = 0; delta_len = 0; lbuf_size = 0; lit_len = 0; lit_run = 0;
+        opcode_len = 0; off_lo_len = 0; off_hi_len = 0; delta_len = 0; lbuf_size = 0; lit_len = 0; lit_run = 0;
 
         /* DP backward.
          * choice[u]: 0=literal, 1..ZXL_MAX_CANDIDATES=match candidate,
@@ -568,16 +781,18 @@ static size_t compress_block(MatchCtx *ctx,
                              * Offset bytes → param_buf; length bytes → lbuf. */
                             if (m->offset < 256u && lm < 256u) {
                                 opcode_buf[opcode_len++] = TOK_EXACT1;
-                                off_buf[off_len++] = (uint8_t)m->offset;
+                                off_lo_buf[off_lo_len++] = (uint8_t)m->offset;
                                 lbuf[lbuf_size++] = (uint8_t)lm;
                             } else if (m->offset < 65536u && lm < 256u) {
                                 opcode_buf[opcode_len++] = TOK_EXACT2;
-                                write_u16(off_buf + off_len, (uint16_t)m->offset);
-                                off_len += 2;
+                                off_lo_buf[off_lo_len++] = (uint8_t)(m->offset);
+                                off_hi_buf[off_hi_len++] = (uint8_t)(m->offset >> 8);
                                 lbuf[lbuf_size++] = (uint8_t)lm;
                             } else {
                                 opcode_buf[opcode_len++] = TOK_EXACT;
-                                write_u24(off_buf + off_len, m->offset); off_len += 3;
+                                off_lo_buf[off_lo_len++]  = (uint8_t)(m->offset);
+                                off_hi_buf[off_hi_len++]  = (uint8_t)(m->offset >> 8);
+                                off_hi_buf[off_hi_len++]  = (uint8_t)(m->offset >> 16);
                                 write_u16(lbuf + lbuf_size, (uint16_t)lm); lbuf_size += 2;
                             }
                             rep[4] = rep[3]; rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = m->offset;
@@ -589,20 +804,22 @@ static size_t compress_block(MatchCtx *ctx,
                             opcode_buf[opcode_len++] = TOK_DELTA1;
                             delta_buf[delta_len++] = m->mtype;
                             delta_buf[delta_len++] = m->delta;
-                            off_buf[off_len++] = (uint8_t)m->offset;
+                            off_lo_buf[off_lo_len++] = (uint8_t)m->offset;
                             lbuf[lbuf_size++] = (uint8_t)lm;
                         } else if (m->offset < 65536u && lm < 256u) {
                             opcode_buf[opcode_len++] = TOK_DELTA2;
                             delta_buf[delta_len++] = m->mtype;
                             delta_buf[delta_len++] = m->delta;
-                            write_u16(off_buf + off_len, (uint16_t)m->offset);
-                            off_len += 2;
+                            off_lo_buf[off_lo_len++] = (uint8_t)(m->offset);
+                            off_hi_buf[off_hi_len++] = (uint8_t)(m->offset >> 8);
                             lbuf[lbuf_size++] = (uint8_t)lm;
                         } else {
                             opcode_buf[opcode_len++] = TOK_DELTA;
                             delta_buf[delta_len++] = m->mtype;
                             delta_buf[delta_len++] = m->delta;
-                            write_u24(off_buf + off_len, m->offset); off_len += 3;
+                            off_lo_buf[off_lo_len++] = (uint8_t)(m->offset);
+                            off_hi_buf[off_hi_len++] = (uint8_t)(m->offset >> 8);
+                            off_hi_buf[off_hi_len++] = (uint8_t)(m->offset >> 16);
                             write_u16(lbuf + lbuf_size, (uint16_t)lm); lbuf_size += 2;
                         }
                         prev_out = (m->mtype == MTYPE_XOR)
@@ -643,13 +860,21 @@ static size_t compress_block(MatchCtx *ctx,
             /* Param entropy: separate estimates for offset/type/delta bytes (h_param)
              * and length bytes (h_plen).  DP overhead uses the appropriate rate for
              * each field: offsets cost h_param bits each, lengths cost h_plen bits. */
-            float h_off = 0.0f;
-            if (off_len > 0) {
+            float h_off_lo = 0.0f, h_off_hi = 0.0f;
+            if (off_lo_len > 0) {
                 uint32_t pc[256] = {0};
-                for (size_t _j = 0; _j < off_len; _j++) pc[off_buf[_j]]++;
-                float fpar = (float)off_len;
+                for (size_t _j = 0; _j < off_lo_len; _j++) pc[off_lo_buf[_j]]++;
+                float fpar = (float)off_lo_len;
                 for (int _j = 0; _j < 256; _j++) {
-                    if (pc[_j] > 0) { float _p = (float)pc[_j]/fpar; h_off -= _p*log2f(_p); }
+                    if (pc[_j] > 0) { float _p = (float)pc[_j]/fpar; h_off_lo -= _p*log2f(_p); }
+                }
+            }
+            if (off_hi_len > 0) {
+                uint32_t pc[256] = {0};
+                for (size_t _j = 0; _j < off_hi_len; _j++) pc[off_hi_buf[_j]]++;
+                float fpar = (float)off_hi_len;
+                for (int _j = 0; _j < 256; _j++) {
+                    if (pc[_j] > 0) { float _p = (float)pc[_j]/fpar; h_off_hi -= _p*log2f(_p); }
                 }
             }
             float h_delta = 0.0f;
@@ -674,16 +899,22 @@ static size_t compress_block(MatchCtx *ctx,
              * Param counts: (n_off offset/delta bytes, n_len length bytes) per token.
              *   EXACT1: 1 off + 1 len   EXACT2: 2 off + 1 len   EXACT: 3 off + 2 len
              *   DELTA1: 3 off + 1 len   DELTA2: 4 off + 1 len   DELTA: 5 off + 2 len */
-            /* n_off=offset bytes, n_delta=mtype+delta bytes, n_len=length bytes */
-            #define OVHD(tid, n_off, n_delta, n_len, fb) \
-                ((oc[(tid)] > 0) ? (_ovhd_ctx((float)oc_am[(tid)], (float)oc_al[(tid)], ftok_am, ftok_al, ftok) + (n_off)*h_off + (n_delta)*h_delta + (n_len)*h_plen) : (fb))
-            ovhd_exact1 = OVHD(TOK_EXACT1, 1.0f, 0.0f, 1.0f, 24.0f);
-            ovhd_exact2 = OVHD(TOK_EXACT2, 2.0f, 0.0f, 1.0f, 32.0f);
-            ovhd_exact  = OVHD(TOK_EXACT,  3.0f, 0.0f, 2.0f, 48.0f);
-            ovhd_delta1 = OVHD(TOK_DELTA1, 1.0f, 2.0f, 1.0f, 40.0f);
-            ovhd_delta2 = OVHD(TOK_DELTA2, 2.0f, 2.0f, 1.0f, 48.0f);
-            ovhd_delta  = OVHD(TOK_DELTA,  3.0f, 2.0f, 2.0f, 64.0f);
-            #undef OVHD
+            /* Offset bytes split: lo stream (1 per match) + hi stream (1 for E2/D2, 2 for E/D).
+             *   EXACT1: 1 lo                     + 1 len
+             *   EXACT2: 1 lo + 1 hi              + 1 len
+             *   EXACT:  1 lo + 2 hi              + 2 len
+             *   DELTA1: 1 lo          + 2 delta  + 1 len
+             *   DELTA2: 1 lo + 1 hi   + 2 delta  + 1 len
+             *   DELTA:  1 lo + 2 hi   + 2 delta  + 2 len */
+            #define OVHD_OP(tid, fb) \
+                ((oc[(tid)] > 0) ? _ovhd_ctx((float)oc_am[(tid)], (float)oc_al[(tid)], ftok_am, ftok_al, ftok) : (fb))
+            ovhd_exact1 = OVHD_OP(TOK_EXACT1, 8.0f) + 1.0f*h_off_lo + 0.0f*h_off_hi + 0.0f*h_delta + 1.0f*h_plen;
+            ovhd_exact2 = OVHD_OP(TOK_EXACT2, 8.0f) + 1.0f*h_off_lo + 1.0f*h_off_hi + 0.0f*h_delta + 1.0f*h_plen;
+            ovhd_exact  = OVHD_OP(TOK_EXACT,  8.0f) + 1.0f*h_off_lo + 2.0f*h_off_hi + 0.0f*h_delta + 2.0f*h_plen;
+            ovhd_delta1 = OVHD_OP(TOK_DELTA1, 8.0f) + 1.0f*h_off_lo + 0.0f*h_off_hi + 2.0f*h_delta + 1.0f*h_plen;
+            ovhd_delta2 = OVHD_OP(TOK_DELTA2, 8.0f) + 1.0f*h_off_lo + 1.0f*h_off_hi + 2.0f*h_delta + 1.0f*h_plen;
+            ovhd_delta  = OVHD_OP(TOK_DELTA,  8.0f) + 1.0f*h_off_lo + 2.0f*h_off_hi + 2.0f*h_delta + 2.0f*h_plen;
+            #undef OVHD_OP
             if (ovhd_exact1 < 16.0f) ovhd_exact1 = 16.0f;
             if (ovhd_exact2 < 24.0f) ovhd_exact2 = 24.0f;
             if (ovhd_exact  < 32.0f) ovhd_exact  = 32.0f;
@@ -737,7 +968,7 @@ static size_t compress_block(MatchCtx *ctx,
     size_t am_len = 0, al_len = 0;
     if (!opcode_am || !opcode_al) {
         free(opcode_am); free(opcode_al);
-        free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
+        free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
     }
     {
         int ctx = 0; /* start in after-match context */
@@ -760,11 +991,15 @@ static size_t compress_block(MatchCtx *ctx,
     RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
     rans_build_tables(al_counts, al_syms, al_slots);
 
-    uint32_t off_counts[256] = {0};
-    for (size_t i = 0; i < off_len; i++) off_counts[off_buf[i]]++;
-    RansSym  off_syms[256];
-    RansSlot off_slots[RANS_SCALE];
-    rans_build_tables(off_counts, off_syms, off_slots);
+    uint32_t off_lo_counts[256] = {0};
+    for (size_t i = 0; i < off_lo_len; i++) off_lo_counts[off_lo_buf[i]]++;
+    RansSym  off_lo_syms[256]; RansSlot off_lo_slots[RANS_SCALE];
+    rans_build_tables(off_lo_counts, off_lo_syms, off_lo_slots);
+
+    uint32_t off_hi_counts[256] = {0};
+    for (size_t i = 0; i < off_hi_len; i++) off_hi_counts[off_hi_buf[i]]++;
+    RansSym  off_hi_syms[256]; RansSlot off_hi_slots[RANS_SCALE];
+    rans_build_tables(off_hi_counts, off_hi_syms, off_hi_slots);
 
     uint32_t delta_counts[256] = {0};
     for (size_t i = 0; i < delta_len; i++) delta_counts[delta_buf[i]]++;
@@ -782,9 +1017,9 @@ static size_t compress_block(MatchCtx *ctx,
      * Split lit_buf into N_LIT_CTX sub-streams by (prev_byte >> N_LIT_CTX_SHIFT).
      * Each sub-stream has its own rANS frequency table, reducing literal entropy
      * by exploiting byte-pair correlations in binary/PE data. */
-    size_t scratch_cap = zxl_bound(block_len + lit_len + off_len + delta_len);
+    size_t scratch_cap = zxl_bound(block_len + lit_len + off_lo_len + off_hi_len + delta_len);
     uint8_t *scratch = (uint8_t *)malloc(scratch_cap);
-    if (!scratch) { free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
+    if (!scratch) { free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
 
     /* Count and partition literals into N_LIT_CTX sub-streams */
     size_t lit_sub_len[N_LIT_CTX]; memset(lit_sub_len, 0, sizeof(lit_sub_len));
@@ -793,7 +1028,7 @@ static size_t compress_block(MatchCtx *ctx,
     { size_t cum = 0; for (int c = 0; c < N_LIT_CTX; c++) { lit_sub_off[c] = cum; cum += lit_sub_len[c]; } }
 
     uint8_t *lit_sub = (uint8_t *)malloc(lit_len + N_LIT_CTX);
-    if (!lit_sub) { free(scratch); free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
+    if (!lit_sub) { free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
     { size_t idx[N_LIT_CTX]; for (int c = 0; c < N_LIT_CTX; c++) idx[c] = lit_sub_off[c];
       for (size_t j = 0; j < lit_len; j++) {
           uint8_t ctx = lit_ctx_buf[j];
@@ -808,11 +1043,11 @@ static size_t compress_block(MatchCtx *ctx,
     uint8_t *lit_enc = (lit_syms_ctx) ? (uint8_t *)malloc(scratch_cap) : NULL;
     if (!lit_syms_ctx || !lit_enc) {
         free(lit_syms_ctx); free(lit_enc);
-        free(lit_sub); free(scratch); free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
+        free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
     }
     {
         RansSlot *tmp_slots = (RansSlot *)malloc(RANS_SCALE * sizeof(RansSlot));
-        if (!tmp_slots) { free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
+        if (!tmp_slots) { free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
         for (int c = 0; c < N_LIT_CTX; c++) {
             uint32_t cnt[256] = {0};
             for (size_t j = 0; j < lit_sub_len[c]; j++)
@@ -821,7 +1056,7 @@ static size_t compress_block(MatchCtx *ctx,
             if (lit_sub_len[c] > 0) {
                 size_t enc = rans_encode(lit_sub + lit_sub_off[c], lit_sub_len[c],
                                          lit_syms_ctx[c], scratch, scratch_cap);
-                if (!enc) { free(tmp_slots); free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
+                if (!enc) { free(tmp_slots); free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
                 memcpy(lit_enc + lit_enc_total, scratch, enc);
                 lit_enc_sz[c] = enc;
                 lit_enc_total += enc;
@@ -843,7 +1078,7 @@ static size_t compress_block(MatchCtx *ctx,
         }
     #define FREE2OP free(opcode_am); free(opcode_al); \
                     free(lit_enc); free(scratch); free(opcode_buf); \
-                    free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf)
+                    free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf)
 
     ENC_OP(am, opcode_am, am_len, am_syms, enc_opcode_am, opcode_am_enc, FREE2OP)
     ENC_OP(al, opcode_al, al_len, al_syms, enc_opcode_al, opcode_al_enc,
@@ -854,15 +1089,26 @@ static size_t compress_block(MatchCtx *ctx,
                      if(opcode_am_enc)free(opcode_am_enc); \
                      FREE2OP
 
-    /* ---- Encode offset stream (offset bytes only) ----------------- */
-    size_t   enc_off = 0;
-    uint8_t *off_enc = NULL;
-    if (off_len > 0) {
-        enc_off = rans_encode(off_buf, off_len, off_syms, scratch, scratch_cap);
-        if (!enc_off) { FREE4ALL; return 0; }
-        off_enc = (uint8_t *)malloc(enc_off);
-        if (!off_enc) { FREE4ALL; return 0; }
-        memcpy(off_enc, scratch, enc_off);
+    /* ---- Encode offset-lo stream ----------------------------------- */
+    size_t   enc_off_lo = 0;
+    uint8_t *off_lo_enc = NULL;
+    if (off_lo_len > 0) {
+        enc_off_lo = rans_encode(off_lo_buf, off_lo_len, off_lo_syms, scratch, scratch_cap);
+        if (!enc_off_lo) { FREE4ALL; return 0; }
+        off_lo_enc = (uint8_t *)malloc(enc_off_lo);
+        if (!off_lo_enc) { FREE4ALL; return 0; }
+        memcpy(off_lo_enc, scratch, enc_off_lo);
+    }
+
+    /* ---- Encode offset-hi stream ----------------------------------- */
+    size_t   enc_off_hi = 0;
+    uint8_t *off_hi_enc = NULL;
+    if (off_hi_len > 0) {
+        enc_off_hi = rans_encode(off_hi_buf, off_hi_len, off_hi_syms, scratch, scratch_cap);
+        if (!enc_off_hi) { if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
+        off_hi_enc = (uint8_t *)malloc(enc_off_hi);
+        if (!off_hi_enc) { if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
+        memcpy(off_hi_enc, scratch, enc_off_hi);
     }
 
     /* ---- Encode delta stream (mtype + delta bytes only) ----------- */
@@ -870,9 +1116,9 @@ static size_t compress_block(MatchCtx *ctx,
     uint8_t *delta_enc = NULL;
     if (delta_len > 0) {
         enc_delta = rans_encode(delta_buf, delta_len, delta_syms, scratch, scratch_cap);
-        if (!enc_delta) { if(off_enc)free(off_enc); FREE4ALL; return 0; }
+        if (!enc_delta) { if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
         delta_enc = (uint8_t *)malloc(enc_delta);
-        if (!delta_enc) { if(off_enc)free(off_enc); FREE4ALL; return 0; }
+        if (!delta_enc) { if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
         memcpy(delta_enc, scratch, enc_delta);
     }
 
@@ -881,9 +1127,9 @@ static size_t compress_block(MatchCtx *ctx,
     uint8_t *len_enc = NULL;
     if (lbuf_size > 0) {
         enc_len = rans_encode(lbuf, lbuf_size, len_syms, scratch, scratch_cap);
-        if (!enc_len) { if(delta_enc)free(delta_enc); if(off_enc)free(off_enc); FREE4ALL; return 0; }
+        if (!enc_len) { if(delta_enc)free(delta_enc); if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
         len_enc = (uint8_t *)malloc(enc_len);
-        if (!len_enc) { if(delta_enc)free(delta_enc); if(off_enc)free(off_enc); FREE4ALL; return 0; }
+        if (!len_enc) { if(delta_enc)free(delta_enc); if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
         memcpy(len_enc, scratch, enc_len);
     }
     #undef FREE4ALL
@@ -891,58 +1137,66 @@ static size_t compress_block(MatchCtx *ctx,
     free(scratch);
 
     /*
-     * Block header (ZXLA):
-     *   [4]×13            fields: uncomp, enc_am, enc_al,
-     *                             enc_off, enc_delta, enc_len, lit_enc_total,
-     *                             dec_am, dec_al, dec_off, dec_delta, dec_len, dec_lit
-     *   [256*2]×5         freq tables: am, al, off, delta, len
+     * Block header (ZXLC):
+     *   [4]×15            fields: uncomp, enc_am, enc_al,
+     *                             enc_off_lo, enc_off_hi, enc_delta, enc_len, lit_enc_total,
+     *                             dec_am, dec_al, dec_off_lo, dec_off_hi, dec_delta, dec_len, dec_lit
+     *   [256*2]×6         freq tables: am, al, off_lo, off_hi, delta, len
      *   [N_LIT_CTX*256*2] literal freq tables
      *   [N_LIT_CTX*4]×2   lit sub-stream sizes (compressed + decoded)
-     *   streams: am, al, off, delta, len, lit[0..N-1]
+     *   streams: am, al, off_lo, off_hi, delta, len, lit[0..N-1]
      *
-     *   enc_am == 0 → raw fallback (literal copy at offset 52)
+     *   enc_am == 0 → raw fallback (literal copy at offset 60)
      */
-    size_t hdr_size = 4*13 + 256*2*5 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
+    #define N_HDR_FIELDS 15
+    size_t hdr_size = 4*N_HDR_FIELDS + 256*2*6 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
-    size_t total_needed = hdr_size + total_opcode + enc_off + enc_delta + enc_len + lit_enc_total;
+    size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
     if (total_needed > dst_cap) {
-        if (len_enc) free(len_enc); if (delta_enc) free(delta_enc); if (off_enc) free(off_enc);
+        if (len_enc) free(len_enc);
+        if (delta_enc) free(delta_enc);
+        if (off_hi_enc) free(off_hi_enc);
+        if (off_lo_enc) free(off_lo_enc);
         if (opcode_al_enc) free(opcode_al_enc);
         if (opcode_am_enc) free(opcode_am_enc);
         free(opcode_am); free(opcode_al);
         free(lit_syms_ctx); free(lit_enc);
-        free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
-        /* Raw fallback: enc_am=0 signals no compression; raw data at offset 52 */
-        if (block_len + 52 > dst_cap) return 0;
-        for (int _i = 0; _i < 13; _i++) write_u32(dst + _i*4, 0);
-        write_u32(dst,    (uint32_t)block_len);   /* uncomp_size */
-        write_u32(dst+24, (uint32_t)block_len);   /* lit_enc_total = raw size (field [6]) */
-        write_u32(dst+48, (uint32_t)block_len);   /* dec_lit (field [12]) */
-        memcpy(dst+52, src + block_start, block_len);
-        return 52 + block_len;
+        free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
+        /* Raw fallback: enc_am=0 signals no compression; raw data at offset N_HDR_FIELDS*4 */
+        size_t raw_hdr = (size_t)(N_HDR_FIELDS * 4);
+        if (block_len + raw_hdr > dst_cap) return 0;
+        for (int _i = 0; _i < N_HDR_FIELDS; _i++) write_u32(dst + _i*4, 0);
+        write_u32(dst,    (uint32_t)block_len);              /* uncomp_size */
+        write_u32(dst+28, (uint32_t)block_len);              /* lit_enc_total (field [7]) */
+        write_u32(dst+(N_HDR_FIELDS-1)*4, (uint32_t)block_len); /* dec_lit */
+        memcpy(dst+raw_hdr, src + block_start, block_len);
+        return raw_hdr + block_len;
     }
 
     uint8_t *p = dst;
-    write_u32(p, (uint32_t)block_len);         p += 4;  /* [0] uncomp */
-    write_u32(p, (uint32_t)enc_opcode_am);     p += 4;  /* [1] enc_am (0=raw) */
-    write_u32(p, (uint32_t)enc_opcode_al);     p += 4;  /* [2] */
-    write_u32(p, (uint32_t)enc_off);           p += 4;  /* [3] */
-    write_u32(p, (uint32_t)enc_delta);         p += 4;  /* [4] */
-    write_u32(p, (uint32_t)enc_len);           p += 4;  /* [5] */
-    write_u32(p, (uint32_t)lit_enc_total);     p += 4;  /* [6] */
-    write_u32(p, (uint32_t)am_len);            p += 4;  /* [7]  dec_am */
-    write_u32(p, (uint32_t)al_len);            p += 4;  /* [8]  dec_al */
-    write_u32(p, (uint32_t)off_len);           p += 4;  /* [9]  dec_off */
-    write_u32(p, (uint32_t)delta_len);         p += 4;  /* [10] dec_delta */
-    write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [11] dec_len */
-    write_u32(p, (uint32_t)lit_len);           p += 4;  /* [12] dec_lit */
+    write_u32(p, (uint32_t)block_len);         p += 4;  /* [0]  uncomp */
+    write_u32(p, (uint32_t)enc_opcode_am);     p += 4;  /* [1]  enc_am (0=raw) */
+    write_u32(p, (uint32_t)enc_opcode_al);     p += 4;  /* [2]  enc_al */
+    write_u32(p, (uint32_t)enc_off_lo);        p += 4;  /* [3]  enc_off_lo */
+    write_u32(p, (uint32_t)enc_off_hi);        p += 4;  /* [4]  enc_off_hi */
+    write_u32(p, (uint32_t)enc_delta);         p += 4;  /* [5]  enc_delta */
+    write_u32(p, (uint32_t)enc_len);           p += 4;  /* [6]  enc_len */
+    write_u32(p, (uint32_t)lit_enc_total);     p += 4;  /* [7]  lit_enc_total */
+    write_u32(p, (uint32_t)am_len);            p += 4;  /* [8]  dec_am */
+    write_u32(p, (uint32_t)al_len);            p += 4;  /* [9]  dec_al */
+    write_u32(p, (uint32_t)off_lo_len);        p += 4;  /* [10] dec_off_lo */
+    write_u32(p, (uint32_t)off_hi_len);        p += 4;  /* [11] dec_off_hi */
+    write_u32(p, (uint32_t)delta_len);         p += 4;  /* [12] dec_delta */
+    write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [13] dec_len */
+    write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
-    for (int i = 0; i < 256; i++) { write_u16(p, am_syms[i].freq);    p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, al_syms[i].freq);    p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, off_syms[i].freq);   p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, delta_syms[i].freq); p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, len_syms[i].freq);   p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, am_syms[i].freq);       p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, al_syms[i].freq);       p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, off_lo_syms[i].freq);   p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, off_hi_syms[i].freq);   p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, delta_syms[i].freq);    p += 2; }
+    for (int i = 0; i < 256; i++) { write_u16(p, len_syms[i].freq);      p += 2; }
     for (int c = 0; c < N_LIT_CTX; c++)
         for (int i = 0; i < 256; i++) { write_u16(p, lit_syms_ctx[c][i].freq); p += 2; }
     for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_enc_sz[c]);  p += 4; }
@@ -950,17 +1204,22 @@ static size_t compress_block(MatchCtx *ctx,
 
     if (opcode_am_enc && enc_opcode_am) { memcpy(p, opcode_am_enc, enc_opcode_am); p += enc_opcode_am; }
     if (opcode_al_enc && enc_opcode_al) { memcpy(p, opcode_al_enc, enc_opcode_al); p += enc_opcode_al; }
-    if (off_enc   && enc_off)   { memcpy(p, off_enc,   enc_off);   p += enc_off; }
-    if (delta_enc && enc_delta) { memcpy(p, delta_enc, enc_delta); p += enc_delta; }
-    if (len_enc   && enc_len)   { memcpy(p, len_enc,   enc_len);   p += enc_len; }
+    if (off_lo_enc && enc_off_lo) { memcpy(p, off_lo_enc, enc_off_lo); p += enc_off_lo; }
+    if (off_hi_enc && enc_off_hi) { memcpy(p, off_hi_enc, enc_off_hi); p += enc_off_hi; }
+    if (delta_enc && enc_delta)   { memcpy(p, delta_enc,  enc_delta);  p += enc_delta; }
+    if (len_enc   && enc_len)     { memcpy(p, len_enc,    enc_len);    p += enc_len; }
     memcpy(p, lit_enc, lit_enc_total); p += lit_enc_total;
 
-    if (len_enc) free(len_enc); if (delta_enc) free(delta_enc); if (off_enc) free(off_enc);
+    if (len_enc) free(len_enc);
+    if (delta_enc) free(delta_enc);
+    if (off_hi_enc) free(off_hi_enc);
+    if (off_lo_enc) free(off_lo_enc);
     if (opcode_al_enc) free(opcode_al_enc);
     if (opcode_am_enc) free(opcode_am_enc);
     free(opcode_am); free(opcode_al);
     free(lit_syms_ctx); free(lit_enc);
-    free(opcode_buf); free(off_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
+    free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
+    #undef N_HDR_FIELDS
     return (size_t)(p - dst);
 }
 
@@ -988,38 +1247,42 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
                                size_t global_out_pos,
                                size_t *consumed)
 {
-    /* ZXLA header: 13 uint32 fields (52 bytes) */
-    if (src_len < 52) return 0;
-    uint32_t uncomp_size    = read_u32(src);
-    uint32_t opcode_am_size = read_u32(src + 4);   /* enc_am (0 = raw fallback) */
-    uint32_t opcode_al_size = read_u32(src + 8);
-    uint32_t off_size       = read_u32(src + 12);
-    uint32_t delta_size     = read_u32(src + 16);
-    uint32_t len_size       = read_u32(src + 20);
-    uint32_t lit_size       = read_u32(src + 24);
-    uint32_t am_dec_len     = read_u32(src + 28);
-    uint32_t al_dec_len     = read_u32(src + 32);
-    uint32_t off_dec_len    = read_u32(src + 36);
-    uint32_t delta_dec_len  = read_u32(src + 40);
-    uint32_t len_dec_len    = read_u32(src + 44);
-    uint32_t lit_dec_len    = read_u32(src + 48);
+    /* ZXLC header: 15 uint32 fields (60 bytes) */
+    #define N_HDR_FIELDS_D 15
+    size_t raw_hdr_d = (size_t)(N_HDR_FIELDS_D * 4);
+    if (src_len < raw_hdr_d) return 0;
+    uint32_t uncomp_size     = read_u32(src);
+    uint32_t opcode_am_size  = read_u32(src + 4);   /* enc_am (0 = raw fallback) */
+    uint32_t opcode_al_size  = read_u32(src + 8);
+    uint32_t off_lo_size     = read_u32(src + 12);
+    uint32_t off_hi_size     = read_u32(src + 16);
+    uint32_t delta_size      = read_u32(src + 20);
+    uint32_t len_size        = read_u32(src + 24);
+    uint32_t lit_size        = read_u32(src + 28);
+    uint32_t am_dec_len      = read_u32(src + 32);
+    uint32_t al_dec_len      = read_u32(src + 36);
+    uint32_t off_lo_dec_len  = read_u32(src + 40);
+    uint32_t off_hi_dec_len  = read_u32(src + 44);
+    uint32_t delta_dec_len   = read_u32(src + 48);
+    uint32_t len_dec_len     = read_u32(src + 52);
+    uint32_t lit_dec_len     = read_u32(src + 56);
 
     if (global_out_pos + uncomp_size > dst_cap) return 0;
 
     /* Uncompressed fallback (enc_am == 0) */
     if (opcode_am_size == 0) {
-        if (src_len < 52 + lit_size) return 0;
-        memcpy(dst + global_out_pos, src + 52, lit_size);
-        *consumed = 52 + lit_size;
+        if (src_len < raw_hdr_d + lit_size) return 0;
+        memcpy(dst + global_out_pos, src + raw_hdr_d, lit_size);
+        *consumed = raw_hdr_d + lit_size;
         return lit_size;
     }
 
-    /* ZXLA header: 13 uint32 + 5 freq tables + N_LIT_CTX lit_tables + 2×N_LIT_CTX sizes */
-    size_t hdr = 52 + 256*2*5 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
+    /* Header: N_HDR_FIELDS uint32 + 6 freq tables + N_LIT_CTX lit_tables + 2×N_LIT_CTX sizes */
+    size_t hdr = raw_hdr_d + 256*2*6 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
     if (src_len < hdr + opcode_am_size + opcode_al_size
-                      + off_size + delta_size + len_size + lit_size) return 0;
+                      + off_lo_size + off_hi_size + delta_size + len_size + lit_size) return 0;
 
-    const uint8_t *tp = src + 52;
+    const uint8_t *tp = src + raw_hdr_d;
 
     /* Two opcode freq tables: am, al */
     RansSym  am_syms[256];  RansSlot am_slots[RANS_SCALE];
@@ -1029,11 +1292,17 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     { uint32_t cnt[256]={0}; for(int i=0;i<256;i++){al_syms[i].freq=read_u16(tp);cnt[i]=al_syms[i].freq;tp+=2;}
       rans_build_tables(cnt,al_syms,al_slots); }
 
-    /* Offset freq table (offset bytes only) */
-    RansSym  off_syms[256];  RansSlot off_slots[RANS_SCALE];
+    /* Offset-lo freq table */
+    RansSym  off_lo_syms_d[256];  RansSlot off_lo_slots_d[RANS_SCALE];
     { uint32_t cnt[256] = {0};
-      for (int i = 0; i < 256; i++) { off_syms[i].freq = read_u16(tp); cnt[i] = off_syms[i].freq; tp += 2; }
-      rans_build_tables(cnt, off_syms, off_slots); }
+      for (int i = 0; i < 256; i++) { off_lo_syms_d[i].freq = read_u16(tp); cnt[i] = off_lo_syms_d[i].freq; tp += 2; }
+      rans_build_tables(cnt, off_lo_syms_d, off_lo_slots_d); }
+
+    /* Offset-hi freq table */
+    RansSym  off_hi_syms_d[256];  RansSlot off_hi_slots_d[RANS_SCALE];
+    { uint32_t cnt[256] = {0};
+      for (int i = 0; i < 256; i++) { off_hi_syms_d[i].freq = read_u16(tp); cnt[i] = off_hi_syms_d[i].freq; tp += 2; }
+      rans_build_tables(cnt, off_hi_syms_d, off_hi_slots_d); }
 
     /* Delta freq table (mtype+deltaval bytes) */
     RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
@@ -1063,10 +1332,11 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     const uint8_t *opcode_am_stream = tp;
     const uint8_t *opcode_al_stream = tp + opcode_am_size;
     size_t op2 = opcode_am_size + opcode_al_size;
-    const uint8_t *off_stream   = tp + op2;
-    const uint8_t *delta_stream = tp + op2 + off_size;
-    const uint8_t *len_stream   = tp + op2 + off_size + delta_size;
-    const uint8_t *lit_stream   = tp + op2 + off_size + delta_size + len_size;
+    const uint8_t *off_lo_stream = tp + op2;
+    const uint8_t *off_hi_stream = tp + op2 + off_lo_size;
+    const uint8_t *delta_stream  = tp + op2 + off_lo_size + off_hi_size;
+    const uint8_t *len_stream    = tp + op2 + off_lo_size + off_hi_size + delta_size;
+    const uint8_t *lit_stream    = tp + op2 + off_lo_size + off_hi_size + delta_size + len_size;
 
     /* Decode 2 opcode sub-streams */
     #define DEC_OP(buf, stream, enc_sz, dec_len, slots, cleanup) \
@@ -1082,13 +1352,23 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
 
     #define FREE2BUF free(opcode_al_buf); free(opcode_am_buf)
 
-    /* Decode offset stream — offset bytes only */
-    uint8_t *off_buf = NULL;
-    if (off_dec_len > 0) {
-        off_buf = (uint8_t *)malloc(off_dec_len + 64);
-        if (!off_buf) { FREE2BUF; free(lit_slots_all); return 0; }
-        if (rans_decode(off_stream, off_size, off_slots, off_buf, off_dec_len) != 0) {
-            free(off_buf); FREE2BUF; free(lit_slots_all); return 0;
+    /* Decode offset-lo stream */
+    uint8_t *off_lo_buf_d = NULL;
+    if (off_lo_dec_len > 0) {
+        off_lo_buf_d = (uint8_t *)malloc(off_lo_dec_len + 64);
+        if (!off_lo_buf_d) { FREE2BUF; free(lit_slots_all); return 0; }
+        if (rans_decode(off_lo_stream, off_lo_size, off_lo_slots_d, off_lo_buf_d, off_lo_dec_len) != 0) {
+            free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
+        }
+    }
+
+    /* Decode offset-hi stream */
+    uint8_t *off_hi_buf_d = NULL;
+    if (off_hi_dec_len > 0) {
+        off_hi_buf_d = (uint8_t *)malloc(off_hi_dec_len + 64);
+        if (!off_hi_buf_d) { if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
+        if (rans_decode(off_hi_stream, off_hi_size, off_hi_slots_d, off_hi_buf_d, off_hi_dec_len) != 0) {
+            free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
         }
     }
 
@@ -1096,9 +1376,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *delta_buf = NULL;
     if (delta_dec_len > 0) {
         delta_buf = (uint8_t *)malloc(delta_dec_len + 64);
-        if (!delta_buf) { if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0; }
+        if (!delta_buf) { if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
         if (rans_decode(delta_stream, delta_size, delta_slots, delta_buf, delta_dec_len) != 0) {
-            free(delta_buf); if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0;
+            free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
         }
     }
 
@@ -1106,15 +1386,15 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *len_buf = NULL;
     if (len_dec_len > 0) {
         len_buf = (uint8_t *)malloc(len_dec_len + 64);
-        if (!len_buf) { if(delta_buf)free(delta_buf); if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0; }
+        if (!len_buf) { if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
         if (rans_decode(len_stream, len_size, len_slots, len_buf, len_dec_len) != 0) {
-            free(len_buf); if(delta_buf)free(delta_buf); if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0;
+            free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
         }
     }
 
     /* Decode N_LIT_CTX literal sub-streams into flat buffer */
     uint8_t *lit_flat = (uint8_t *)malloc(lit_dec_len + N_LIT_CTX);
-    if (!lit_flat) { if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0; }
+    if (!lit_flat) { if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
     size_t lit_sub_idx[N_LIT_CTX];
     {
         const uint8_t *sub_src = lit_stream;
@@ -1125,7 +1405,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
                 if (rans_decode(sub_src, lit_enc_sz[c],
                                 lit_slots_all + c * RANS_SCALE,
                                 lit_flat + cum, lit_dec_sz[c]) != 0) {
-                    free(lit_flat); if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_buf)free(off_buf); FREE2BUF; free(lit_slots_all); return 0;
+                    free(lit_flat); if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
                 }
             }
             sub_src += lit_enc_sz[c];
@@ -1138,14 +1418,17 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
      * Opcodes are read from two sub-streams based on context:
      *   ctx=0 (after-match or start): read from opcode_am_buf
      *   ctx=1 (after-literal):        read from opcode_al_buf
-     * pi     = param index into param_buf (offset/mtype/delta bytes)
-     * pi_len = index into len_buf (match length bytes)
+     * pi_off_lo = index into off_lo_buf_d
+     * pi_off_hi = index into off_hi_buf_d
+     * pi_delta  = index into delta_buf
+     * pi_len    = index into len_buf
      * prev_out tracks last byte; its high bits select literal context. */
-    size_t   am_idx   = 0;   /* after-match opcode stream index */
-    size_t   al_idx   = 0;   /* after-lit   opcode stream index */
-    size_t   pi_off   = 0;
-    size_t   pi_delta = 0;
-    size_t   pi_len   = 0;
+    size_t   am_idx    = 0;   /* after-match opcode stream index */
+    size_t   al_idx    = 0;   /* after-lit   opcode stream index */
+    size_t   pi_off_lo = 0;
+    size_t   pi_off_hi = 0;
+    size_t   pi_delta  = 0;
+    size_t   pi_len    = 0;
     size_t   out_pos  = global_out_pos;
     size_t   out_end  = global_out_pos + uncomp_size;
     uint32_t rep[5]   = {0u, 0u, 0u, 0u, 0u};
@@ -1161,7 +1444,10 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         op_ctx = (tok < 0xF5u) ? 1 : 0;
 
         if (tok == TOK_EXACT) {
-            uint32_t off = read_u24(off_buf + pi_off); pi_off += 3;
+            uint32_t off = (uint32_t)off_lo_buf_d[pi_off_lo];
+            off |= (uint32_t)off_hi_buf_d[pi_off_hi] << 8;
+            off |= (uint32_t)off_hi_buf_d[pi_off_hi + 1] << 16;
+            pi_off_lo++; pi_off_hi += 2;
             uint32_t len = read_u16(len_buf + pi_len) + ZXL_MIN_MATCH; pi_len += 2;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1171,7 +1457,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
             rep[4] = rep[3]; rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = off;
 
         } else if (tok == TOK_EXACT1) {
-            uint32_t off = off_buf[pi_off++];
+            uint32_t off = off_lo_buf_d[pi_off_lo++];
             uint32_t len = (uint32_t)len_buf[pi_len++] + ZXL_MIN_MATCH;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1181,7 +1467,8 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
             rep[4] = rep[3]; rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = off;
 
         } else if (tok == TOK_EXACT2) {
-            uint32_t off = read_u16(off_buf + pi_off); pi_off += 2;
+            uint32_t off = (uint32_t)off_lo_buf_d[pi_off_lo++]
+                         | ((uint32_t)off_hi_buf_d[pi_off_hi++] << 8);
             uint32_t len = (uint32_t)len_buf[pi_len++] + ZXL_MIN_MATCH;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1212,7 +1499,10 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         } else if (tok == TOK_DELTA) {
             uint8_t  mtype = delta_buf[pi_delta++];
             uint8_t  delta = delta_buf[pi_delta++];
-            uint32_t off   = read_u24(off_buf + pi_off); pi_off += 3;
+            uint32_t off   = (uint32_t)off_lo_buf_d[pi_off_lo];
+            off |= (uint32_t)off_hi_buf_d[pi_off_hi] << 8;
+            off |= (uint32_t)off_hi_buf_d[pi_off_hi + 1] << 16;
+            pi_off_lo++; pi_off_hi += 2;
             uint32_t len   = read_u16(len_buf + pi_len) + ZXL_MIN_MATCH; pi_len += 2;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1227,7 +1517,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         } else if (tok == TOK_DELTA1) {
             uint8_t  mtype = delta_buf[pi_delta++];
             uint8_t  delta = delta_buf[pi_delta++];
-            uint32_t off   = off_buf[pi_off++];
+            uint32_t off   = off_lo_buf_d[pi_off_lo++];
             uint32_t len   = (uint32_t)len_buf[pi_len++] + ZXL_MIN_MATCH;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1242,7 +1532,8 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         } else if (tok == TOK_DELTA2) {
             uint8_t  mtype = delta_buf[pi_delta++];
             uint8_t  delta = delta_buf[pi_delta++];
-            uint32_t off   = read_u16(off_buf + pi_off); pi_off += 2;
+            uint32_t off   = (uint32_t)off_lo_buf_d[pi_off_lo++]
+                           | ((uint32_t)off_hi_buf_d[pi_off_hi++] << 8);
             uint32_t len   = (uint32_t)len_buf[pi_len++] + ZXL_MIN_MATCH;
             if (out_pos < off || out_pos + len > out_end) break;
             const uint8_t *ref = dst + out_pos - off;
@@ -1269,13 +1560,14 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
 
     FREE2BUF;
     #undef FREE2BUF
-    if (off_buf)   free(off_buf);
+    if (off_lo_buf_d) free(off_lo_buf_d);
+    if (off_hi_buf_d) free(off_hi_buf_d);
     if (delta_buf) free(delta_buf);
     if (len_buf)   free(len_buf);
     free(lit_flat);
 
     *consumed = hdr + opcode_am_size + opcode_al_size
-                    + off_size + delta_size + len_size + lit_size;
+                    + off_lo_size + off_hi_size + delta_size + len_size + lit_size;
     return out_pos - global_out_pos;
 }
 
@@ -1301,9 +1593,10 @@ int zxl_compress(const uint8_t *src, size_t src_len,
         bcj_buf = (uint8_t *)malloc(src_len);
         if (bcj_buf) {
             memcpy(bcj_buf, src, src_len);
-            bcj_x86_forward(bcj_buf, src_len);
+            bcj_x64_forward(bcj_buf, src_len);  /* x64 RIP-relative first */
+            bcj_x86_forward(bcj_buf, src_len);  /* then x86 E8/E9/Jcc */
             work  = bcj_buf;
-            flags = ZXL_FLAG_BCJ;
+            flags = ZXL_FLAG_BCJ | ZXL_FLAG_BCJ64;
         }
     }
 
@@ -1378,9 +1671,11 @@ int zxl_decompress(const uint8_t *src, size_t src_len,
         p += blk_comp;
     }
 
-    /* Undo BCJ filter if it was applied during compression */
+    /* Undo BCJ filters in reverse order of application */
     if (flags & ZXL_FLAG_BCJ)
         bcj_x86_inverse(dst, out_pos);
+    if (flags & ZXL_FLAG_BCJ64)
+        bcj_x64_inverse(dst, out_pos);
 
     *dst_len = out_pos;
     return 0;

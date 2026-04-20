@@ -11,16 +11,17 @@ compressors — surpassing zstd-19, LZMA/xz, 7-zip Ultra, and eventually PPMd-cl
 | kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  | ~0.425  | ~0.375 | ~0.345   |
 | user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  | ~0.349  | ~0.310 | ~0.285   |
 
-## Current (ZXLB, 2026-04-09)
+## Current (post C1 x64 BCJ, 2026-04-20)
 
-| File         | ZXLB   | gzip-9 | zstd-9 | bzip2-9 |
+| File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4462 | 0.4596 | 0.4442 | 0.4346  |
-| kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  |
+| ntdll.dll    | 0.4348 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4375 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3579 | 0.3852 | 0.3630 | 0.3651  |
 
-ZXL9 streams: opcode_am + opcode_al + param(off/delta) + len(lm) + 16×literal (14 rANS models)
-Compress: 0.4–0.8 MB/s. Decompress: 171–219 MB/s.
+Streams: opcode_am + opcode_al + off_buf + delta_buf + lbuf + 16×literal (21 rANS models)
+Chain depth: 1024. Match candidates: 5 per position.
+Compress: ~0.1–0.2 MB/s. Decompress: ~120–140 MB/s.
 
 ---
 
@@ -50,6 +51,11 @@ Estimated total gain: −3 to −5 pts
       literal runs capped at 245. rep[] expanded to 5 entries throughout.
       **Result: −0.1 to −0.3 pts (ZXLB, 2026-04-09)**
 
+- [x] **A6** Deeper hash chains + 5 match candidates. CHAIN_DEPTH 256 → 1024.
+      match_find expanded to 5 candidates: best-savings, shortest viable,
+      best EXACT1/DELTA1 (off < 256), best mid-offset (256 ≤ off < 65536), longest-any.
+      **Result: −0.22/−0.12/−0.09 pts ntdll/kernel32/user32 (2026-04-13)**
+
 ---
 
 ## Phase 2 — Beat zstd-19
@@ -78,10 +84,11 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       Different sections have different statistics; cross-section pollution hurts models.
       Expected: −0.2 to −0.5 pts.
 
-- [ ] **C1** x64 BCJ filter: RIP-relative addressing (64-bit PE files).
+- [x] **C1** x64 BCJ filter: RIP-relative addressing (64-bit PE files).
       `MOV rax, [rip+X]`, `LEA rax, [rip+X]` → convert to absolute addresses.
       Opcode patterns: `48 8B 05 XX XX XX XX`, `48 8D 05 XX XX XX XX`, etc.
-      Expected: −0.3 to −1.0 pts (larger on 64-bit binaries).
+      Plus 0F-prefixed SSE/CMOV variants and 0x83/0xC7/0xF7 immediate-group ops.
+      **Result: −0.70/−0.34/−0.58 pts ntdll/kernel32/user32 (2026-04-20)**
 
 - [ ] **C2** Import table delta filter. IAT entries are 8-byte (64-bit) pointers
       clustered near each other. Apply delta encoding on the IAT section.
@@ -150,8 +157,9 @@ Estimated total gain: highly implementation-dependent
 - [x] Beat gzip-9 on all benchmark files (ZXLB, 2026-04-09)
 - [x] Beat zstd-3 on all benchmark files (ZXL9, 2026-04-09)
 - [x] Beat zstd-9 on kernel32 (ZXL9, 2026-04-09)
-- [ ] Beat zstd-9 convincingly on ALL files (ntdll gap: 2.1 pts)  ← Phase 1 target
-- [ ] Beat bzip2-9 on all files (ntdll gap: 11.7 pts)
+- [x] Beat zstd-9 on ALL files (2026-04-20, post C1 x64 BCJ)
+- [x] Beat bzip2-9 on kernel32 and user32 (2026-04-20)
+- [ ] Beat bzip2-9 on ntdll (gap: 0.02 pts, essentially tied)
 - [ ] Beat zstd-19 on all files                                    ← Phase 2 target
 - [ ] Beat LZMA / xz -9 on all files                              ← Phase 3 target
 - [ ] Beat 7-zip Ultra on all files                                ← Phase 4 target

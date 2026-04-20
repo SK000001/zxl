@@ -44,9 +44,9 @@ No external dependencies. Requires GCC with AVX2/SSE2 support (`-march=native`).
 - Each block: 4-pass DP → build 7 output streams → rANS-encode each stream independently → write block header + encoded streams. Raw fallback if compression expands the block.
 
 **`src/zxl_match.c`** — LZ matching engine with three independent chained hash tables (one each for exact, XOR-diff, add-diff matching).
-- `match_find()` returns up to 3 candidates: best-savings match, shortest viable match, and best small-offset match (offset < 256, length-4 < 256). All three feed the DP.
+- `match_find()` returns up to 5 candidates: best-savings match, shortest viable match, best small-offset match (offset < 256), best mid-offset match (256 ≤ offset < 65536), and longest match of any type. All five feed the DP.
 - `match_update()` inserts the current position into all three chains.
-- Hash table: **2^19 = 512 K buckets**; chain depth: 256 candidates per type; sliding window: **2 MB** (`ZXL_WINDOW = 2^21`); min match: 4 bytes; max match: 65535 bytes.
+- Hash table: **2^19 = 512 K buckets**; chain depth: 1024 candidates per type; sliding window: **2 MB** (`ZXL_WINDOW = 2^21`); min match: 4 bytes; max match: 65535 bytes.
 - AVX2 (32-byte) or SSE2 (16-byte) SIMD accelerates match extension.
 
 **`src/zxl_rans.c`** — Range ANS entropy coder (Fabian Giesen's "Simple rANS"). `rans_build_tables()` normalises byte frequencies to sum 4096 (scale bits = 12). Encodes backward then reverses in-place. Used for all seven independent streams per block.
@@ -101,6 +101,16 @@ Per 1 MB block:
     [lit_enc_sz[0..15]]  literal context sub-streams (rANS, 16 independent)
 ```
 
-## Current Status (as of 2026-04-09)
+## Current Status (as of 2026-04-20)
 
-Implementation complete including: BCJ filter, LRU-5 REP cache, variable-length EXACT1/2/EXACT and DELTA1/2/DELTA tokens, 4-pass DP optimal parsing, 2-context opcode entropy coding, 16-context literal entropy coding, and 7 independent rANS streams per block. Remaining work: benchmark against zstd/lz4, and parameter tuning (chain depth, block size, literal context count).
+Implementation complete including: BCJ x86 filter (E8/E9/Jcc), BCJ x64 RIP-relative filter, LRU-5 REP cache, variable-length EXACT1/2/EXACT and DELTA1/2/DELTA tokens, 4-pass DP optimal parsing, 5-candidate match finder, 2-context opcode entropy coding, 16-context literal entropy coding, and 7 independent rANS streams per block.
+
+Benchmark results (2026-04-20, post x64 RIP-relative BCJ filter):
+
+| File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
+|--------------|--------|--------|--------|---------|
+| ntdll.dll    | 0.4348 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4375 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3579 | 0.3852 | 0.3630 | 0.3651  |
+
+Beats gzip-9 and zstd-9 on all files. Beats bzip2-9 on kernel32 and user32; essentially ties bzip2-9 on ntdll. Next target: beat zstd-19.
