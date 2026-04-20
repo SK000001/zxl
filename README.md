@@ -44,9 +44,9 @@ No external dependencies. Requires GCC with AVX2/SSE2 support (`-march=native`).
 - Each block: 4-pass DP → build 7 output streams → rANS-encode each stream independently → write block header + encoded streams. Raw fallback if compression expands the block.
 
 **`src/zxl_match.c`** — LZ matching engine with three independent chained hash tables (one each for exact, XOR-diff, add-diff matching).
-- `match_find()` returns up to 5 candidates: best-savings match, shortest viable match, best small-offset match (offset < 256), best mid-offset match (256 ≤ offset < 65536), and longest match of any type. All five feed the DP.
-- `match_update()` inserts the current position into all three chains.
-- Hash table: **2^19 = 512 K buckets**; chain depth: 1024 candidates per type; sliding window: **2 MB** (`ZXL_WINDOW = 2^21`); min match: 4 bytes; max match: 65535 bytes.
+- `match_find()` returns up to 6 candidates: best-savings match, shortest viable match, best small-offset match (offset < 256), best mid-offset match (256 ≤ offset < 65536), longest match of any type, and best 3-byte short match (offset < 256, fits TOK_EXACT0). All six feed the DP.
+- `match_update()` inserts the current position into all four chains (exact, XOR-delta, additive-delta, and 3-gram short).
+- Hash table: **2^19 = 512 K buckets** × 4 chains; chain depth: 2048 for 4-byte chains, 64 for 3-byte short chain; sliding window: **2 MB** (`ZXL_WINDOW = 2^21`); min match: **3 bytes** (via EXACT0), 4 bytes for all other match types; max match: 65535 bytes.
 - AVX2 (32-byte) or SSE2 (16-byte) SIMD accelerates match extension.
 
 **`src/zxl_rans.c`** — Range ANS entropy coder (Fabian Giesen's "Simple rANS"). `rans_build_tables()` normalises byte frequencies to sum 4096 (scale bits = 12). Encodes backward then reverses in-place. Used for all seven independent streams per block.
@@ -58,7 +58,8 @@ No external dependencies. Requires GCC with AVX2/SSE2 support (`-march=native`).
 ```
 Token byte  Payload                             Description
 ─────────────────────────────────────────────────────────────────────────
-0x00..0xF4  (none)                              Literal run; run length = tok+1 (1–245 bytes)
+0x00..0xF3  (none)                              Literal run; run length = tok+1 (1–244 bytes)
+0xF4        off[1]                              TOK_EXACT0: 3-byte exact match, 1-byte offset, implicit length 3
 0xF5        lbuf[1]: len-MIN_MATCH              TOK_REP3: reuse 4th-last offset
 0xF6        lbuf[1]: len-MIN_MATCH              TOK_REP4: reuse 5th-last offset
 0xF7        off[1], lbuf[1]                     TOK_EXACT1: 1-byte offset (1–255), 1-byte len
@@ -103,14 +104,14 @@ Per 1 MB block:
 
 ## Current Status (as of 2026-04-20)
 
-Implementation complete including: BCJ x86 filter (E8/E9/Jcc), BCJ x64 RIP-relative filter, LRU-5 REP cache, variable-length EXACT1/2/EXACT and DELTA1/2/DELTA tokens, 4-pass DP optimal parsing, 5-candidate match finder, 2-context opcode entropy coding, 16-context literal entropy coding, and 7 independent rANS streams per block.
+Implementation complete including: BCJ x86 filter (E8/E9/Jcc), BCJ x64 RIP-relative filter, LRU-5 REP cache, variable-length EXACT0/1/2/EXACT and DELTA1/2/DELTA tokens, 3-byte MIN_MATCH via TOK_EXACT0 with dedicated 3-gram hash, 4-pass DP optimal parsing, 6-candidate match finder, 2-context opcode entropy coding, 16-context literal entropy coding, and 7 independent rANS streams per block.
 
-Benchmark results (2026-04-20, post x64 RIP-relative BCJ filter):
+Benchmark results (2026-04-20, post B2 3-byte MIN_MATCH):
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4348 | 0.4596 | 0.4442 | 0.4346  |
-| kernel32.dll | 0.4375 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3579 | 0.3852 | 0.3630 | 0.3651  |
+| ntdll.dll    | 0.4244 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4304 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3521 | 0.3852 | 0.3630 | 0.3651  |
 
-Beats gzip-9 and zstd-9 on all files. Beats bzip2-9 on kernel32 and user32; essentially ties bzip2-9 on ntdll. Next target: beat zstd-19.
+Beats gzip-9, zstd-9, AND bzip2-9 on all files. Next target: beat zstd-19.

@@ -59,8 +59,9 @@
 #define ZXL_FLAG_BCJ64 0x02u  /* x64 RIP-relative BCJ filter was applied */
 
 /*
- * Token byte values (ZXLB):
- *   0x00..0xF4  literal run (run = tok+1, max 245 bytes)
+ * Token byte values (ZXLC):
+ *   0x00..0xF3  literal run (run = tok+1, max 244 bytes)
+ *   0xF4        TOK_EXACT0:  [1] offset   (3-byte exact match, implicit length 3)
  *   0xF5        TOK_REP3:    [1] len-MIN_MATCH  (reuse 4th-last offset)
  *   0xF6        TOK_REP4:    [1] len-MIN_MATCH  (reuse 5th-last offset)
  *   0xF7        TOK_EXACT1:  [1] offset,         [1] len-MIN_MATCH
@@ -73,12 +74,15 @@
  *   0xFE        TOK_EXACT:   [3] offset,         [2] len-MIN_MATCH  (large off or long match)
  *   0xFF        TOK_DELTA:   [1]mtype,[1]delta,[3]offset,[2]len-MIN_MATCH
  *
- * Variable-length offset/length: EXACT1/DELTA1 cover offsets 1-255 with len-4 0-255;
+ * Variable-length offset/length: EXACT0 is a dedicated 3-byte short match
+ * (offset 1-255, implicit length 3, no length byte, no rep-cache update).
+ * EXACT1/DELTA1 cover offsets 1-255 with len-4 0-255;
  * EXACT2/DELTA2 cover offsets 256-65535 with len-4 0-255.  TOK_EXACT/DELTA handle
  * anything larger (offset >= 65536 or len-4 >= 256).
  * REP uses 1-byte length (LRU-5 cache); if a REP match would need 2-byte length it
  * falls through to TOK_EXACT with the REP offset (still updates rep cache).
  */
+#define TOK_EXACT0  0xF4u   /* 3-byte exact match, implicit len, 1-byte offset */
 #define TOK_REP3    0xF5u
 #define TOK_REP4    0xF6u
 #define TOK_EXACT1  0xF7u
@@ -91,6 +95,7 @@
 #define TOK_EXACT   0xFEu
 #define TOK_DELTA   0xFFu
 #define N_REP       5     /* LRU REP cache size */
+#define MAX_LIT_RUN 244   /* max literal bytes per run token (token 0x00..0xF3) */
 
 /* ------------------------------------------------------------------ */
 /* x64 RIP-relative BCJ filter                                        */
@@ -506,12 +511,12 @@ static size_t compress_block(MatchCtx *ctx,
     uint32_t lit_run = 0;  /* pending literal count */
 
     /* Flush pending literals as a token + raw bytes.
-     * Max run = 245 (token 0xF4); tokens 0xF5..0xFF are reserved for
-     * REP3/REP4/EXACT1/EXACT2/DELTA1/DELTA2/REP0/REP1/REP2/EXACT/DELTA.
+     * Max run = 244 (token 0xF3); tokens 0xF4..0xFF are reserved for
+     * EXACT0/REP3/REP4/EXACT1/EXACT2/DELTA1/DELTA2/REP0/REP1/REP2/EXACT/DELTA.
      * Literal run tokens are opcodes only — no params. */
     #define FLUSH_LITS() do { \
         while (lit_run > 0) { \
-            uint32_t run = lit_run < 245 ? lit_run : 245; \
+            uint32_t run = lit_run < MAX_LIT_RUN ? lit_run : MAX_LIT_RUN; \
             opcode_buf[opcode_len++] = (uint8_t)(run - 1); \
             lit_run -= run; \
         } \
@@ -548,7 +553,9 @@ static size_t compress_block(MatchCtx *ctx,
         return 0;
     }
 
-    /* Forward pass: find up to ZXL_MAX_CANDIDATES matches per position. */
+    /* Forward pass: find up to ZXL_MAX_CANDIDATES matches per position.
+     * We update the 4-byte chains only when 4 bytes remain; short 3-byte
+     * chain can be updated/searched whenever 3 bytes remain. */
     for (uint32_t i = 0; i < (uint32_t)block_len; i++) {
         uint32_t p = (uint32_t)block_start + i;
         if (p + ZXL_MIN_MATCH <= end_pos) {
@@ -631,7 +638,9 @@ static size_t compress_block(MatchCtx *ctx,
      */
     /* Per-variant overhead estimates (bits); corrected after pass 1.
      * Suffix 1/2/none = 1-byte / 2-byte / 3-byte offset encoding.
-     * Param counts: EXACT1=2, EXACT2=3, EXACT=5, DELTA1=4, DELTA2=5, DELTA=7. */
+     * Param counts: EXACT0=1 (offset only), EXACT1=2, EXACT2=3, EXACT=5,
+     *                DELTA1=4, DELTA2=5, DELTA=7. */
+    float ovhd_exact0 = 16.0f;  /* 3-byte exact: opcode + 1B offset only */
     float ovhd_exact1 = 24.0f, ovhd_exact2 = 32.0f, ovhd_exact = 48.0f;
     float ovhd_delta1 = 40.0f, ovhd_delta2 = 48.0f, ovhd_delta = 64.0f;
     float ovhd_rep    = 16.0f;  /* REP: token byte + 1B len = 2 param bytes */
@@ -660,10 +669,18 @@ static size_t compress_block(MatchCtx *ctx,
             choice_len[u] = 0;
 
             /* Helper macro: try a match candidate at a specific length.
-             * Updates dp[u], choice[u], choice_len[u] if this is cheaper. */
+             * Updates dp[u], choice[u], choice_len[u] if this is cheaper.
+             * Length 3 with MTYPE_EXACT and offset<256 uses the EXACT0 path
+             * (opcode only + 1 offset byte, no length byte, no rep cache).
+             * Length 3 otherwise not allowed (ZXL_MIN_MATCH=4 is the minimum
+             * for all other encodings). */
             #define TRY_MATCH_LEN(cand_id, _m, try_len) do { \
                 uint32_t _tl = (try_len); \
-                if (_tl >= ZXL_MIN_MATCH && _tl <= (_m)->length && u + _tl <= (uint32_t)block_len) { \
+                if (_tl == 3u && (_m)->mtype == MTYPE_EXACT && (_m)->offset < 256u \
+                    && _tl <= (_m)->length && u + _tl <= (uint32_t)block_len) { \
+                    float _dp_m = ovhd_exact0 + dp[u + _tl]; \
+                    if (_dp_m < dp[u]) { dp[u] = _dp_m; choice[u] = (cand_id); choice_len[u] = _tl; } \
+                } else if (_tl >= ZXL_MIN_MATCH && _tl <= (_m)->length && u + _tl <= (uint32_t)block_len) { \
                     uint32_t _lm = _tl - ZXL_MIN_MATCH; \
                     float _ovhd; \
                     if ((_m)->mtype == MTYPE_EXACT) { \
@@ -689,6 +706,9 @@ static size_t compress_block(MatchCtx *ctx,
                 uint32_t mlen = _m->length;
                 /* Full length */
                 TRY_MATCH_LEN(cid, _m, mlen);
+                /* EXACT0 special: length 3 with offset<256 (cheaper than 4-byte EXACT1) */
+                if (_m->mtype == MTYPE_EXACT && _m->offset < 256u && mlen >= 3u)
+                    TRY_MATCH_LEN(cid, _m, 3u);
                 /* Min match length */
                 if (mlen > ZXL_MIN_MATCH)
                     TRY_MATCH_LEN(cid, _m, ZXL_MIN_MATCH);
@@ -760,7 +780,7 @@ static size_t compress_block(MatchCtx *ctx,
                     lit_buf[lit_len++]   = b;
                     prev_out = b;
                     lit_run++;
-                    if (lit_run == 245) FLUSH_LITS();
+                    if (lit_run == MAX_LIT_RUN) FLUSH_LITS();
                     i++;
                 } else {
                     Match *m = (ch == CHOICE_REP) ? &rep_match[i]
@@ -769,6 +789,17 @@ static size_t compress_block(MatchCtx *ctx,
                     FLUSH_LITS();
                     uint32_t ref_base = (uint32_t)(block_start + i) - m->offset;
                     uint8_t  ref_last = src[ref_base + use_len - 1];
+                    /* Special short-match path: 3-byte exact, offset < 256.
+                     * Encoded as TOK_EXACT0 + 1-byte offset, no length, no
+                     * rep-cache update (kept disjoint from LRU to avoid
+                     * polluting it with ultra-short local matches). */
+                    if (m->mtype == MTYPE_EXACT && use_len == 3u && m->offset < 256u) {
+                        opcode_buf[opcode_len++] = TOK_EXACT0;
+                        off_lo_buf[off_lo_len++] = (uint8_t)m->offset;
+                        prev_out = ref_last;
+                        i += use_len;
+                        continue;
+                    }
                     uint32_t lm = use_len - ZXL_MIN_MATCH;
                     if (m->mtype == MTYPE_EXACT) {
                         int ri = (m->offset == rep[0]) ? 0 :
@@ -861,7 +892,8 @@ static size_t compress_block(MatchCtx *ctx,
               for (size_t _j = 0; _j < opcode_len; _j++) {
                   uint8_t _op = opcode_buf[_j];
                   if (_ctx == 0) oc_am[_op]++; else oc_al[_op]++;
-                  _ctx = (_op < 0xF5u) ? 1 : 0;
+                  /* Literal-run tokens are 0x00..0xF3; 0xF4..0xFF are all match tokens */
+                  _ctx = (_op < 0xF4u) ? 1 : 0;
               }
             }
             uint32_t oc[256];
@@ -920,6 +952,8 @@ static size_t compress_block(MatchCtx *ctx,
              *   DELTA:  1 lo + 2 hi   + 2 delta  + 2 len */
             #define OVHD_OP(tid, fb) \
                 ((oc[(tid)] > 0) ? _ovhd_ctx((float)oc_am[(tid)], (float)oc_al[(tid)], ftok_am, ftok_al, ftok) : (fb))
+            /* EXACT0: opcode + 1 off_lo byte, no length, no delta → h_op + h_off_lo */
+            ovhd_exact0 = OVHD_OP(TOK_EXACT0, 8.0f) + 1.0f*h_off_lo + 0.0f*h_off_hi + 0.0f*h_delta + 0.0f*h_plen;
             ovhd_exact1 = OVHD_OP(TOK_EXACT1, 8.0f) + 1.0f*h_off_lo + 0.0f*h_off_hi + 0.0f*h_delta + 1.0f*h_plen;
             ovhd_exact2 = OVHD_OP(TOK_EXACT2, 8.0f) + 1.0f*h_off_lo + 1.0f*h_off_hi + 0.0f*h_delta + 1.0f*h_plen;
             ovhd_exact  = OVHD_OP(TOK_EXACT,  8.0f) + 1.0f*h_off_lo + 2.0f*h_off_hi + 0.0f*h_delta + 2.0f*h_plen;
@@ -927,6 +961,7 @@ static size_t compress_block(MatchCtx *ctx,
             ovhd_delta2 = OVHD_OP(TOK_DELTA2, 8.0f) + 1.0f*h_off_lo + 1.0f*h_off_hi + 2.0f*h_delta + 1.0f*h_plen;
             ovhd_delta  = OVHD_OP(TOK_DELTA,  8.0f) + 1.0f*h_off_lo + 2.0f*h_off_hi + 2.0f*h_delta + 2.0f*h_plen;
             #undef OVHD_OP
+            if (ovhd_exact0 < 10.0f) ovhd_exact0 = 10.0f;
             if (ovhd_exact1 < 16.0f) ovhd_exact1 = 16.0f;
             if (ovhd_exact2 < 24.0f) ovhd_exact2 = 24.0f;
             if (ovhd_exact  < 32.0f) ovhd_exact  = 32.0f;
@@ -988,7 +1023,7 @@ static size_t compress_block(MatchCtx *ctx,
             uint8_t op = opcode_buf[i];
             if (ctx == 0) opcode_am[am_len++] = op;
             else          opcode_al[al_len++] = op;
-            ctx = (op < 0xF5u) ? 1 : 0;
+            ctx = (op < 0xF4u) ? 1 : 0;
         }
     }
 
@@ -1453,9 +1488,20 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         uint8_t tok;
         if (op_ctx == 0) tok = opcode_am_buf[am_idx++];
         else             tok = opcode_al_buf[al_idx++];
-        op_ctx = (tok < 0xF5u) ? 1 : 0;
+        op_ctx = (tok < 0xF4u) ? 1 : 0;
 
-        if (tok == TOK_EXACT) {
+        if (tok == TOK_EXACT0) {
+            /* 3-byte exact match: 1-byte offset, implicit length 3, no rep update */
+            uint32_t off = off_lo_buf_d[pi_off_lo++];
+            if (out_pos < off || out_pos + 3u > out_end) break;
+            const uint8_t *ref = dst + out_pos - off;
+            dst[out_pos]   = ref[0];
+            dst[out_pos+1] = ref[1];
+            dst[out_pos+2] = ref[2];
+            prev_out = dst[out_pos + 2];
+            out_pos += 3;
+
+        } else if (tok == TOK_EXACT) {
             uint32_t off = (uint32_t)off_lo_buf_d[pi_off_lo];
             off |= (uint32_t)off_hi_buf_d[pi_off_hi] << 8;
             off |= (uint32_t)off_hi_buf_d[pi_off_hi + 1] << 16;

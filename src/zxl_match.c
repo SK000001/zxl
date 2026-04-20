@@ -18,6 +18,13 @@ static inline uint32_t hash_exact(const uint8_t *p)
     return ((v * 2654435761u) >> (32 - ZXL_HASH_BITS)) & ZXL_HASH_MASK;
 }
 
+/* Short: hash the raw 3-byte value at p for 3-byte exact-match lookups. */
+static inline uint32_t hash_short(const uint8_t *p)
+{
+    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return ((v * 506832829u) >> (32 - ZXL_HASH_BITS)) & ZXL_HASH_MASK;
+}
+
 /*
  * XOR-diff: hash the first-differences under XOR.
  *   diff[0] = p[0]^p[1],  diff[1] = p[1]^p[2],  diff[2] = p[2]^p[3]
@@ -253,7 +260,7 @@ int match_find(MatchCtx *ctx,
                const uint8_t *src, size_t src_len,
                uint32_t pos, Match out[ZXL_MAX_CANDIDATES])
 {
-    if (pos + ZXL_MIN_MATCH > src_len) return 0;
+    if (pos + 3u > src_len) return 0;
 
     uint32_t max_len = (uint32_t)(src_len - pos);
     if (max_len > ZXL_MAX_MATCH) max_len = ZXL_MAX_MATCH;
@@ -282,23 +289,61 @@ int match_find(MatchCtx *ctx,
     Match   longest;
     longest.length = 0;
 
-    /* --- 1. Exact chain -------------------------------------------- */
-    WALK_CHAIN(ctx->exact_ht[hash_exact(cur)], ctx->exact_next,
-               MTYPE_EXACT, extend_exact_wrap, 0u);
+    /* Best 3-byte exact match with offset < 256 (fits TOK_EXACT0).
+     * Chosen independently of 4-byte matches — even a 3-byte match
+     * with offset 255 beats 3 literals (~16 bits vs ~24). */
+    Match   short3;
+    short3.length = 0;
+    uint32_t short3_best_off = 0xFFFFFFFFu;  /* smaller offset preferred */
 
-    /* --- 2. XOR-delta chain ---------------------------------------- */
-    if (pos + 4 <= src_len)
+    /* Only walk 4+byte chains when enough input remains for a 4-byte match. */
+    if (pos + ZXL_MIN_MATCH <= src_len) {
+        /* --- 1. Exact chain -------------------------------------------- */
+        WALK_CHAIN(ctx->exact_ht[hash_exact(cur)], ctx->exact_next,
+                   MTYPE_EXACT, extend_exact_wrap, 0u);
+
+        /* --- 2. XOR-delta chain ---------------------------------------- */
         WALK_CHAIN(ctx->xdiff_ht[hash_xdiff(cur)], ctx->xdiff_next,
                    MTYPE_XOR, extend_xor, (uint8_t)(cur[0] ^ src[_ref]));
 
-    /* --- 3. Additive-delta chain ----------------------------------- */
-    if (pos + 4 <= src_len)
+        /* --- 3. Additive-delta chain ----------------------------------- */
         WALK_CHAIN(ctx->adiff_ht[hash_adiff(cur)], ctx->adiff_next,
                    MTYPE_ADD, extend_add, (uint8_t)(cur[0] - src[_ref]));
+    }
 
-    if (best.length == 0) return 0;
-    out[0] = best;
-    int n = 1;
+    /* --- 4. Short (3-byte) chain, only for offset < 256 ------------ */
+    /* Walk up to a limited number of entries looking for a 3-byte match.
+     * Requires offset < 256 to use TOK_EXACT0 (1-byte offset). */
+    if (pos + 3u <= src_len) {
+        uint32_t ref = ctx->short_ht[hash_short(cur)];
+        int walked = 0;
+        /* Short chain is cheap — bound by a smaller depth than full chain */
+        const int SHORT_DEPTH = 64;
+        while (ref != 0xFFFFFFFFu && walked < SHORT_DEPTH) {
+            if (pos > ref) {
+                uint32_t off = pos - ref;
+                if (off >= 256u) break;  /* chain is oldest-first; no smaller offset ahead */
+                /* Verify 3-byte match (hash is not a guarantee) */
+                const uint8_t *refp = src + ref;
+                if (refp[0] == cur[0] && refp[1] == cur[1] && refp[2] == cur[2]) {
+                    /* Prefer smallest offset (better 1-byte offset encoding distribution) */
+                    if (off < short3_best_off) {
+                        short3_best_off   = off;
+                        short3.offset     = off;
+                        short3.length     = 3u;
+                        short3.mtype      = MTYPE_EXACT;
+                        short3.delta      = 0;
+                    }
+                }
+            }
+            ref = ctx->short_next[ref & (ZXL_WINDOW - 1u)];
+            walked++;
+        }
+    }
+
+    if (best.length == 0 && short3.length == 0) return 0;
+    int n = 0;
+    if (best.length > 0) out[n++] = best;
 
     /* Helper: check if match is duplicate of existing candidates */
     #define CHECK_AND_ADD(cand) do { \
@@ -307,7 +352,7 @@ int match_find(MatchCtx *ctx,
             for (int _k = 0; _k < n; _k++) \
                 if ((cand).offset == out[_k].offset && (cand).length == out[_k].length) \
                     { _dup = 1; break; } \
-            if (!_dup) out[n++] = (cand); \
+            if (!_dup && n < ZXL_MAX_CANDIDATES) out[n++] = (cand); \
         } \
     } while (0)
 
@@ -315,6 +360,7 @@ int match_find(MatchCtx *ctx,
     CHECK_AND_ADD(best_e1);
     CHECK_AND_ADD(best_e2);
     CHECK_AND_ADD(longest);
+    CHECK_AND_ADD(short3);
 
     #undef CHECK_AND_ADD
 
@@ -338,4 +384,8 @@ void match_update(MatchCtx *ctx, const uint8_t *src, uint32_t pos)
     h = hash_adiff(p);
     ctx->adiff_next[slot] = ctx->adiff_ht[h];
     ctx->adiff_ht[h] = pos;
+
+    h = hash_short(p);
+    ctx->short_next[slot] = ctx->short_ht[h];
+    ctx->short_ht[h] = pos;
 }

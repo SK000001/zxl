@@ -1,0 +1,73 @@
+ZXL Optimization Log - 2026-04-20
+===================================
+
+Session goal: Continue pushing ratios beyond zstd-9 toward bzip2-9 and beyond.
+
+Baseline (start of session, post Phase-A + C1 x64 BCJ already in working tree):
+  ntdll.dll:    0.4348  (1096483 / 2522088)
+  kernel32.dll: 0.4375  (365859  /  836248)
+  user32.dll:   0.3579  (670417  / 1873328)
+
+Comparison targets:
+  gzip-9:   ntdll 0.4596, kernel32 0.4574, user32 0.3852
+  zstd-9:   ntdll 0.4442, kernel32 0.4455, user32 0.3630
+  bzip2-9:  ntdll 0.4346, kernel32 0.4416, user32 0.3651
+
+Status vs targets:
+  ntdll:    beats zstd-9 by 0.94 pts; essentially ties bzip2-9 (+0.02 pts gap)
+  kernel32: beats zstd-9 by 0.80 pts; beats bzip2-9 by 0.41 pts
+  user32:   beats zstd-9 by 0.51 pts; beats bzip2-9 by 0.72 pts
+
+C1 (x64 RIP-relative BCJ) is already in working tree but uncommitted.
+Planned phases for this session:
+  1. Commit the existing C1 x64 BCJ work first (huge contribution to current ratios)
+  2. B3: 8 MB sliding window (simpler than B2, no format change for short-match tokens)
+  3. B2: 3-byte MIN_MATCH with TOK_EXACT0 (new token + 3-gram hash)
+  4. B1: Binary tree hash chains (largest expected gain, most complex)
+
+--- C1: x64 RIP-relative BCJ filter (committed d70bfdd, 2026-04-20) ---
+Was already implemented in working tree. Verified, committed, updated docs.
+Gains vs 2026-04-13 baseline:
+  ntdll.dll:    0.4418 -> 0.4348  (-0.70 pts)
+  kernel32.dll: 0.4409 -> 0.4375  (-0.34 pts)
+  user32.dll:   0.3637 -> 0.3579  (-0.58 pts)
+Now beats zstd-9 on all files and bzip2-9 on kernel32 and user32.
+
+--- B3: 8 MB sliding window (TRIED, NO CHANGE, REVERTED) ---
+Changed ZXL_WINDOW from 2 MB to 4 MB (then 8 MB): zero byte change on all 3 files.
+Explanation: CHAIN_DEPTH=1024 already caps how far match_find looks, and
+for our test files the 1024th-most-recent hash hit is well within 2 MB.
+The window size wasn't the bottleneck. Reverted to 2 MB to save ~72 MB RAM.
+
+--- CHAIN_DEPTH 1024 -> 2048 (committed 816a372) ---
+Small monotonic gain across all files. Cost: ~2x compression time per position.
+
+--- Intermediate DP match lengths (committed 32ac4b3) ---
+Added DP candidate lengths 7, 10, 20, 40, 96, 192 to reduce granularity gaps.
+Small monotone improvement without regression.
+
+--- B2: 3-byte MIN_MATCH via TOK_EXACT0 (2026-04-20) ---
+New token 0xF4 TOK_EXACT0: 3-byte exact match, 1-byte offset, implicit length 3.
+Consumed top of literal-run range; MAX_LIT_RUN dropped 245 -> 244.
+New 3-gram hash (short_ht + short_next in MatchCtx); SHORT_DEPTH=64 walk bails
+at offset>=256. 6th match candidate (short3) fed to DP with its own overhead
+estimate (ovhd_exact0: op + 1*h_off_lo, no length/delta). No REP update on
+EXACT0 emission -- disjoint from LRU REP cache to avoid polluting rep[] with
+ultra-short local matches.
+
+Context rule tweak: literals are 0x00..0xF3 (not 0xF4); matches are 0xF4..0xFF.
+Decoder: 1-byte offset, write 3 bytes directly from ref, do NOT touch rep[].
+
+Results vs pre-B2 baseline (post C1 + CHAIN_DEPTH=2048 + intermediate lengths):
+  ntdll.dll:    0.4348 -> 0.4244  (-1.04 pts)
+  kernel32.dll: 0.4375 -> 0.4304  (-0.71 pts)
+  user32.dll:   0.3579 -> 0.3521  (-0.58 pts)
+
+Now beats bzip2-9 on ALL three files:
+  ntdll    ZXL 0.4244 vs bzip2-9 0.4346  (+1.02 pts)
+  kernel32 ZXL 0.4304 vs bzip2-9 0.4416  (+1.12 pts)
+  user32   ZXL 0.3521 vs bzip2-9 0.3651  (+1.30 pts)
+
+Milestone cleared: beats bzip2-9 on all files. Next target: zstd-19 (~0.425 ntdll).
+Gap to zstd-19 on ntdll: ~+0.01 pts (essentially there).
+

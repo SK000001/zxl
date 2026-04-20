@@ -59,10 +59,12 @@ typedef struct {
     uint32_t exact_ht  [ZXL_HASH_SIZE];
     uint32_t xdiff_ht  [ZXL_HASH_SIZE];
     uint32_t adiff_ht  [ZXL_HASH_SIZE];
+    uint32_t short_ht  [ZXL_HASH_SIZE];  /* 3-byte hash for TOK_EXACT0 short matches */
 
     uint32_t exact_next[ZXL_WINDOW];
     uint32_t xdiff_next[ZXL_WINDOW];
     uint32_t adiff_next[ZXL_WINDOW];
+    uint32_t short_next[ZXL_WINDOW];
 } MatchCtx;
 
 /*
@@ -90,15 +92,16 @@ static inline int32_t match_savings(uint32_t length, uint8_t mtype)
 void match_ctx_init(MatchCtx *ctx);
 
 /*
- * Find up to 5 matches at src[pos]:
+ * Find up to 6 matches at src[pos]:
  *   out[0] = best-savings match (highest estimated bit savings)
  *   out[1] = shortest viable match (fewest bytes, if different from out[0])
  *   out[2] = best small-offset match (off<256 && lm<256, fits EXACT1/DELTA1)
  *   out[3] = best mid-offset match (256<=off<65536, fits EXACT2/DELTA2)
  *   out[4] = longest match of any type
- * Returns 0..5 (number of distinct matches found).
+ *   out[5] = best 3-byte short match (off<256, length exactly 3, fits TOK_EXACT0)
+ * Returns 0..6 (number of distinct matches found).
  */
-#define ZXL_MAX_CANDIDATES 5
+#define ZXL_MAX_CANDIDATES 6
 int match_find(MatchCtx *ctx,
                const uint8_t *src, size_t src_len,
                uint32_t pos, Match out[ZXL_MAX_CANDIDATES]);

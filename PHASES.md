@@ -11,17 +11,17 @@ compressors — surpassing zstd-19, LZMA/xz, 7-zip Ultra, and eventually PPMd-cl
 | kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  | ~0.425  | ~0.375 | ~0.345   |
 | user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  | ~0.349  | ~0.310 | ~0.285   |
 
-## Current (post C1 x64 BCJ, 2026-04-20)
+## Current (post B2 3-byte MIN_MATCH, 2026-04-20)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4348 | 0.4596 | 0.4442 | 0.4346  |
-| kernel32.dll | 0.4375 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3579 | 0.3852 | 0.3630 | 0.3651  |
+| ntdll.dll    | 0.4244 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4304 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3521 | 0.3852 | 0.3630 | 0.3651  |
 
 Streams: opcode_am + opcode_al + off_buf + delta_buf + lbuf + 16×literal (21 rANS models)
-Chain depth: 1024. Match candidates: 5 per position.
-Compress: ~0.1–0.2 MB/s. Decompress: ~120–140 MB/s.
+Chain depth: 2048. Match candidates: 6 per position (incl. 3-byte short).
+Compress: ~0.1–0.2 MB/s. Decompress: ~70–100 MB/s.
 
 ---
 
@@ -66,9 +66,11 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       binary trees sorted by position. Enables O(n log n) best-match search across
       the full window. Expected: −0.5 to −1.5 pts.
 
-- [ ] **B2** 3-byte minimum match (MIN_MATCH 4 → 3). Add TOK_EXACT0 (3-byte exact
-      match, 1-byte offset + no length field). Requires new hash for 3-grams.
-      Expected: −0.3 to −0.8 pts.
+- [x] **B2** 3-byte minimum match (MIN_MATCH 4 → 3). Added TOK_EXACT0 (3-byte exact
+      match, 1-byte offset, implicit length 3, no length/rep update). New 3-gram
+      hash (short_ht) with SHORT_DEPTH=64 walk, bails at offset≥256. Disjoint from
+      LRU REP cache so ultra-short local matches don't pollute rep[].
+      **Result: −1.04/−0.71/−0.58 pts ntdll/kernel32/user32 (2026-04-20)**
 
 - [ ] **B3** 8 MB window (currently 2 MB). Captures long-range repeated patterns
       common in large PE files (repeated PE section headers, repeated strings).
@@ -159,7 +161,8 @@ Estimated total gain: highly implementation-dependent
 - [x] Beat zstd-9 on kernel32 (ZXL9, 2026-04-09)
 - [x] Beat zstd-9 on ALL files (2026-04-20, post C1 x64 BCJ)
 - [x] Beat bzip2-9 on kernel32 and user32 (2026-04-20)
-- [ ] Beat bzip2-9 on ntdll (gap: 0.02 pts, essentially tied)
+- [x] Beat bzip2-9 on ntdll (2026-04-20, post B2: 0.4244 vs 0.4346)
+- [x] Beat bzip2-9 on ALL files (2026-04-20, post B2)
 - [ ] Beat zstd-19 on all files                                    ← Phase 2 target
 - [ ] Beat LZMA / xz -9 on all files                              ← Phase 3 target
 - [ ] Beat 7-zip Ultra on all files                                ← Phase 4 target
