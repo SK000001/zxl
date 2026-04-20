@@ -3,5 +3,5 @@
 *.zxl
 .claude/
 todo.txt
-tests/*.out
-tests/*.gz
+tests/
+logs/
