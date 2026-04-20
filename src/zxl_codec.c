@@ -752,16 +752,34 @@ static size_t compress_block(MatchCtx *ctx,
             }
             #undef TRY_MATCH_LEN
 
-            /* REP candidate: try full length and MIN_MATCH */
+            /* REP candidate: try full length, MIN_MATCH, and intermediate lengths.
+             * REP is cheap (2 bytes total), so worth trying many cut-points. */
             #define CHOICE_REP (ZXL_MAX_CANDIDATES + 1)
             if (rep_match[u].length > 0) {
                 uint32_t rlen = rep_match[u].length;
-                float dp_match = ovhd_rep + dp[u + rlen];
-                if (dp_match < dp[u]) { dp[u] = dp_match; choice[u] = CHOICE_REP; choice_len[u] = rlen; }
-                if (rlen > ZXL_MIN_MATCH) {
-                    float dp_short = ovhd_rep + dp[u + ZXL_MIN_MATCH];
-                    if (dp_short < dp[u]) { dp[u] = dp_short; choice[u] = CHOICE_REP; choice_len[u] = ZXL_MIN_MATCH; }
-                }
+                #define TRY_REP_LEN(_tl) do { \
+                    uint32_t _tll = (_tl); \
+                    if (_tll >= ZXL_MIN_MATCH && _tll <= rlen && u + _tll <= (uint32_t)block_len) { \
+                        float _dp_r = ovhd_rep + dp[u + _tll]; \
+                        if (_dp_r < dp[u]) { dp[u] = _dp_r; choice[u] = CHOICE_REP; choice_len[u] = _tll; } \
+                    } \
+                } while (0)
+                TRY_REP_LEN(rlen);
+                TRY_REP_LEN(ZXL_MIN_MATCH);
+                TRY_REP_LEN(5u);
+                TRY_REP_LEN(6u);
+                TRY_REP_LEN(8u);
+                TRY_REP_LEN(12u);
+                TRY_REP_LEN(16u);
+                TRY_REP_LEN(24u);
+                TRY_REP_LEN(32u);
+                TRY_REP_LEN(48u);
+                TRY_REP_LEN(64u);
+                TRY_REP_LEN(96u);
+                TRY_REP_LEN(128u);
+                TRY_REP_LEN(192u);
+                TRY_REP_LEN(259u);
+                #undef TRY_REP_LEN
             }
         }
 
@@ -1003,12 +1021,10 @@ static size_t compress_block(MatchCtx *ctx,
 
     /* ---- Split opcode stream into 2 context sub-streams ----------- *
      * Context rule (applied to each opcode position):
-     *   ctx=0 (after-match):   prev opcode was a match token (0xF7..0xFF) or first opcode
-     *   ctx=1 (after-literal): prev opcode was a literal run token (0x00..0xF6)
+     *   ctx=0 (after-match):   prev opcode was a match token (0xF4..0xFF) or first opcode
+     *   ctx=1 (after-literal): prev opcode was a literal run token (0x00..0xF3)
      * After a literal run the next-opcode distribution skews heavily toward match
-     * tokens; after a match it is more mixed.  Separate rANS models exploit this. */
-    /* ---- Split opcode stream into 2 context sub-streams ----------- *
-     * ctx=0 after-match (REP/exact/delta), ctx=1 after-literal (0x00..0xF6).
+     * tokens; after a match it is more mixed.  Separate rANS models exploit this.
      * Block starts in ctx=0 (after-match, neutral). */
     uint8_t *opcode_am = (uint8_t *)malloc(opcode_len + 1);  /* after-match */
     uint8_t *opcode_al = (uint8_t *)malloc(opcode_len + 1);  /* after-lit   */
