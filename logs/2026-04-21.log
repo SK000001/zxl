@@ -26,3 +26,40 @@ warn that deeper would not be productive.
   kernel32.dll: 0.4304 -> 0.4303  (-0.01 pts)
   user32.dll:   0.3521 -> 0.3519  (-0.02 pts)
 
+--- Block size 1 MB -> 4 MB (committed 57167b4) ---
+ntdll goes from 3 blocks to 1 block: per-block rANS header overhead
+(~11 KB for 21 freq tables) amortized over 4x more bytes. kernel32/user32
+already fit in 1 block at 1 MB, so single-block files see no change from
+larger blocks — only ntdll benefits on the block-count axis, but user32
+got a modest parser-history win anyway (no block resets inside parse).
+Tried 2 MB intermediate: ntdll -0.04, user32 -0.21. 4 MB better on ntdll.
+  ntdll.dll:    0.4242 -> 0.4226  (-0.16 pts)
+  kernel32.dll: 0.4303 -> 0.4303  (unchanged)
+  user32.dll:   0.3519 -> 0.3498  (-0.21 pts)
+
+--- N_LIT_CTX 16 -> 32 at 4 MB blocks (TRIED, REVERTED) ---
+Hoped 4 MB blocks would amortize the 16 extra freq tables. But kernel32
+is 836 KB (sub-block), so its overhead fraction didn't improve.
+  ntdll.dll:    0.4226 -> 0.4234  (+0.08 pts)
+  kernel32.dll: 0.4303 -> 0.4374  (+0.71 pts)
+  user32.dll:   0.3498 -> 0.3525  (+0.27 pts)
+Reverted.
+
+--- B4: 2-level hash (committed 71ec9ce) ---
+Secondary 8-byte hash chain (long_ht + long_next in MatchCtx). Walked
+first in match_find so best_savings seeds with a high-quality long-match
+candidate before the 4-byte chain saturates. match_update signature
+extended with src_len to guard OOB read of 8 bytes at block tail.
+Smaller than expected gain: CHAIN_DEPTH=4096 on the 4-byte chain was
+already finding most of the long matches available.
+  ntdll.dll:    0.4226 -> 0.4225  (-0.01 pts)
+  kernel32.dll: 0.4303 -> 0.4303  (unchanged)
+  user32.dll:   0.3498 -> 0.3497  (-0.01 pts)
+
+--- Session summary ---
+End of 2026-04-21: ntdll 0.4225, kernel32 0.4303, user32 0.3497.
+Session delta vs start: -0.17 / 0 / -0.22 pts.
+Still beats bzip2-9 on all files; still ~2 pts above zstd-19 on ntdll.
+Next target: B1 binary-tree hash chains, or D1 compressed freq tables
+(which would unlock N_LIT_CTX=32 without the overhead regression).
+

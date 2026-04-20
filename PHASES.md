@@ -11,16 +11,17 @@ compressors — surpassing zstd-19, LZMA/xz, 7-zip Ultra, and eventually PPMd-cl
 | kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  | ~0.425  | ~0.375 | ~0.345   |
 | user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  | ~0.349  | ~0.310 | ~0.285   |
 
-## Current (post CHAIN_DEPTH=4096, 2026-04-21)
+## Current (post 4 MB blocks + B4 2-level hash, 2026-04-21)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4242 | 0.4596 | 0.4442 | 0.4346  |
+| ntdll.dll    | 0.4225 | 0.4596 | 0.4442 | 0.4346  |
 | kernel32.dll | 0.4303 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3519 | 0.3852 | 0.3630 | 0.3651  |
+| user32.dll   | 0.3497 | 0.3852 | 0.3630 | 0.3651  |
 
 Streams: opcode_am + opcode_al + off_buf + delta_buf + lbuf + 16×literal (21 rANS models)
-Chain depth: 4096. Match candidates: 6 per position (incl. 3-byte short).
+Block size: 4 MB. Chain depth: 4096. Match candidates: 6 per position (incl. 3-byte short).
+Hash chains: exact (4B), xdiff (4B), adiff (4B), short (3B), long (8B — B4).
 Compress: ~0.05–0.1 MB/s. Decompress: ~70–100 MB/s.
 
 ---
@@ -77,9 +78,11 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       Requires scaling WINDOW constant and next[] array size.
       Expected: −0.3 to −0.8 pts on ntdll-size files.
 
-- [ ] **B4** 2-level hash: fast 4-byte table (current) + secondary 8-byte table for
-      long-match candidates. Long exact matches are currently found only by luck of
-      chain walk depth hitting them. Expected: −0.3 to −0.7 pts.
+- [x] **B4** 2-level hash: fast 4-byte table + secondary 8-byte table for long-match
+      candidates. Walked first so best_savings seeds with a high-quality long match
+      before the 4-byte chain saturates.
+      **Result: −0.01/0/−0.01 pts (2026-04-21)** — marginal; CHAIN_DEPTH=4096 on the
+      4-byte chain was already finding most long matches available.
 
 - [ ] **B5** Content-adaptive block boundaries. Detect PE section boundaries
       (`.text`, `.data`, `.rdata`, `.rsrc`) and use them as block split points.
@@ -198,3 +201,17 @@ Estimated total gain: highly implementation-dependent
   16KB extra freq table overhead per 1MB block completely dominates any gain.
 - **Separate offset streams by size class (A4)**: off1/off2/off3 split; neutral result
   (+0.1–0.4 pts). Offset byte distributions too similar across size classes.
+- **N_LIT_CTX 16→32 at 4 MB blocks**: retried A3 hoping larger blocks amortized header.
+  Still regressed: ntdll +0.08, kernel32 +0.71, user32 +0.27. kernel32 (836 KB) is
+  sub-block so overhead fraction is unchanged. Reverted.
+
+---
+
+## Session wins (2026-04-21)
+
+- [x] **Block size 1 MB → 4 MB**. ntdll fits in 1 block instead of 3; per-block rANS
+      header overhead (~11 KB / block × 21 models) amortized over 4x more bytes.
+      **Result: −0.16 / 0 / −0.21 pts ntdll/kernel32/user32.**
+- [x] **B4 2-level hash** (above). **Result: −0.01 / 0 / −0.01 pts.**
+
+Combined session: −0.17 / 0 / −0.22 pts. ntdll moved from 0.4242 to 0.4225.
