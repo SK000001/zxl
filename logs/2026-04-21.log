@@ -1,0 +1,28 @@
+ZXL Optimization Log - 2026-04-21
+===================================
+
+Session goal: Break through zstd-19 barrier toward LZMA/xz-9 territory.
+
+Baseline (end of 2026-04-20 session):
+  ntdll.dll:    0.4244 (beats bzip2-9, essentially ties zstd-19)
+  kernel32.dll: 0.4304 (beats bzip2-9, ties zstd-19)
+  user32.dll:   0.3521 (beats bzip2-9 & zstd-19)
+
+Comparison targets (remaining):
+  zstd-19:  ntdll ~0.428, kernel32 ~0.425, user32 ~0.349
+  lzma/xz:  ntdll ~0.380, kernel32 ~0.375, user32 ~0.310
+  7z Ultra: ntdll ~0.350, kernel32 ~0.345, user32 ~0.285
+
+Planned phases for this session:
+  1. CHAIN_DEPTH 2048 -> 4096 (marginal gain check)
+  2. B4: 2-level hash (secondary 8-byte table for long-match candidates)
+  3. B1: Binary tree hash chains (largest expected gain, most complex)
+  4. B5: Content-adaptive block boundaries (PE section detection)
+
+--- CHAIN_DEPTH 2048 -> 4096 ---
+Tiny monotonic gain at ~2x compress cost. Accepted since diminishing returns
+warn that deeper would not be productive.
+  ntdll.dll:    0.4244 -> 0.4242  (-0.02 pts)
+  kernel32.dll: 0.4304 -> 0.4303  (-0.01 pts)
+  user32.dll:   0.3521 -> 0.3519  (-0.02 pts)
+

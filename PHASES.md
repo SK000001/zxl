@@ -11,17 +11,17 @@ compressors — surpassing zstd-19, LZMA/xz, 7-zip Ultra, and eventually PPMd-cl
 | kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  | ~0.425  | ~0.375 | ~0.345   |
 | user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  | ~0.349  | ~0.310 | ~0.285   |
 
-## Current (post B2 3-byte MIN_MATCH, 2026-04-20)
+## Current (post CHAIN_DEPTH=4096, 2026-04-21)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4244 | 0.4596 | 0.4442 | 0.4346  |
-| kernel32.dll | 0.4304 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3521 | 0.3852 | 0.3630 | 0.3651  |
+| ntdll.dll    | 0.4242 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4303 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3519 | 0.3852 | 0.3630 | 0.3651  |
 
 Streams: opcode_am + opcode_al + off_buf + delta_buf + lbuf + 16×literal (21 rANS models)
-Chain depth: 2048. Match candidates: 6 per position (incl. 3-byte short).
-Compress: ~0.1–0.2 MB/s. Decompress: ~70–100 MB/s.
+Chain depth: 4096. Match candidates: 6 per position (incl. 3-byte short).
+Compress: ~0.05–0.1 MB/s. Decompress: ~70–100 MB/s.
 
 ---
 
