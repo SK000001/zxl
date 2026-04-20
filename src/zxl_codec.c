@@ -43,7 +43,7 @@
 #include <math.h>
 
 #define ZXL_MAGIC      0x424C585Au   /* "ZXLB"  */
-#define ZXL_BLOCK_SIZE (1u << 20)    /* 1 MB   */
+#define ZXL_BLOCK_SIZE (1u << 22)    /* 4 MB - amortizes per-block header overhead */
 
 /*
  * Number of context-conditioned literal models.
