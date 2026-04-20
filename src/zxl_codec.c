@@ -559,7 +559,7 @@ static size_t compress_block(MatchCtx *ctx,
     for (uint32_t i = 0; i < (uint32_t)block_len; i++) {
         uint32_t p = (uint32_t)block_start + i;
         if (p + ZXL_MIN_MATCH <= end_pos) {
-            match_update(ctx, src, p);
+            match_update(ctx, src, (size_t)end_pos, p);
             Match tmp[ZXL_MAX_CANDIDATES];
             int n = match_find(ctx, src, (size_t)end_pos, p, tmp);
             found_arr[i] = (uint8_t)n;

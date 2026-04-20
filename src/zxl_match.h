@@ -60,11 +60,13 @@ typedef struct {
     uint32_t xdiff_ht  [ZXL_HASH_SIZE];
     uint32_t adiff_ht  [ZXL_HASH_SIZE];
     uint32_t short_ht  [ZXL_HASH_SIZE];  /* 3-byte hash for TOK_EXACT0 short matches */
+    uint32_t long_ht   [ZXL_HASH_SIZE];  /* 8-byte hash for long-match candidates (B4) */
 
     uint32_t exact_next[ZXL_WINDOW];
     uint32_t xdiff_next[ZXL_WINDOW];
     uint32_t adiff_next[ZXL_WINDOW];
     uint32_t short_next[ZXL_WINDOW];
+    uint32_t long_next [ZXL_WINDOW];
 } MatchCtx;
 
 /*
@@ -106,7 +108,7 @@ int match_find(MatchCtx *ctx,
                const uint8_t *src, size_t src_len,
                uint32_t pos, Match out[ZXL_MAX_CANDIDATES]);
 
-/* Insert position pos into all three chains. */
-void match_update(MatchCtx *ctx, const uint8_t *src, uint32_t pos);
+/* Insert position pos into all hash chains. */
+void match_update(MatchCtx *ctx, const uint8_t *src, size_t src_len, uint32_t pos);
 
 #endif /* ZXL_MATCH_H */

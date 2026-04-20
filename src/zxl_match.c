@@ -18,6 +18,16 @@ static inline uint32_t hash_exact(const uint8_t *p)
     return ((v * 2654435761u) >> (32 - ZXL_HASH_BITS)) & ZXL_HASH_MASK;
 }
 
+/* Long: hash 8 bytes at p — used by B4 secondary chain for long matches.
+ * Rare collisions mean a chain hit is very likely already a long match,
+ * so we can walk fewer entries to find high-quality long-match candidates. */
+static inline uint32_t hash_long(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return (uint32_t)((v * 11400714819323198485ull) >> (64 - ZXL_HASH_BITS)) & ZXL_HASH_MASK;
+}
+
 /* Short: hash the raw 3-byte value at p for 3-byte exact-match lookups. */
 static inline uint32_t hash_short(const uint8_t *p)
 {
@@ -298,6 +308,15 @@ int match_find(MatchCtx *ctx,
 
     /* Only walk 4+byte chains when enough input remains for a 4-byte match. */
     if (pos + ZXL_MIN_MATCH <= src_len) {
+        /* --- 0. Long (8-byte) exact chain (B4) ------------------------ */
+        /* Secondary hash table with rarer collisions — hits here tend to
+         * already be long matches. Walked first so best.length gets seeded
+         * with a high-quality candidate before the 4-byte chain saturates. */
+        if (pos + 8u <= src_len) {
+            WALK_CHAIN(ctx->long_ht[hash_long(cur)], ctx->long_next,
+                       MTYPE_EXACT, extend_exact_wrap, 0u);
+        }
+
         /* --- 1. Exact chain -------------------------------------------- */
         WALK_CHAIN(ctx->exact_ht[hash_exact(cur)], ctx->exact_next,
                    MTYPE_EXACT, extend_exact_wrap, 0u);
@@ -367,7 +386,7 @@ int match_find(MatchCtx *ctx,
     return n;
 }
 
-void match_update(MatchCtx *ctx, const uint8_t *src, uint32_t pos)
+void match_update(MatchCtx *ctx, const uint8_t *src, size_t src_len, uint32_t pos)
 {
     const uint8_t *p = src + pos;
     uint32_t slot = pos & (ZXL_WINDOW - 1u);
@@ -388,4 +407,11 @@ void match_update(MatchCtx *ctx, const uint8_t *src, uint32_t pos)
     h = hash_short(p);
     ctx->short_next[slot] = ctx->short_ht[h];
     ctx->short_ht[h] = pos;
+
+    /* B4: update 8-byte long-match hash only when 8 bytes available */
+    if ((size_t)pos + 8u <= src_len) {
+        h = hash_long(p);
+        ctx->long_next[slot] = ctx->long_ht[h];
+        ctx->long_ht[h] = pos;
+    }
 }
