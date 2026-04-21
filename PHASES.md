@@ -11,13 +11,13 @@ compressors — surpassing zstd-19, LZMA/xz, 7-zip Ultra, and eventually PPMd-cl
 | kernel32.dll | 0.4442 | 0.4574 | 0.4455 | 0.4416  | ~0.425  | ~0.375 | ~0.345   |
 | user32.dll   | 0.3661 | 0.3852 | 0.3630 | 0.3651  | ~0.349  | ~0.310 | ~0.285   |
 
-## Current (post 4 MB blocks + B4 2-level hash, 2026-04-21)
+## Current (post D1 compact freq tables, 2026-04-22)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 |
 |--------------|--------|--------|--------|---------|
-| ntdll.dll    | 0.4225 | 0.4596 | 0.4442 | 0.4346  |
-| kernel32.dll | 0.4303 | 0.4574 | 0.4455 | 0.4416  |
-| user32.dll   | 0.3497 | 0.3852 | 0.3630 | 0.3651  |
+| ntdll.dll    | 0.4208 | 0.4596 | 0.4442 | 0.4346  |
+| kernel32.dll | 0.4250 | 0.4574 | 0.4455 | 0.4416  |
+| user32.dll   | 0.3473 | 0.3852 | 0.3630 | 0.3651  |
 
 Streams: opcode_am + opcode_al + off_buf + delta_buf + lbuf + 16×literal (21 rANS models)
 Block size: 4 MB. Chain depth: 4096. Match candidates: 6 per position (incl. 3-byte short).
@@ -105,10 +105,13 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
 **Target: ntdll < 0.375 (currently 0.4474, gap ~72 pts)**
 Estimated total gain: −10 to −20 pts on top of Phase 2
 
-- [ ] **D1** Compressed frequency tables (meta-entropy). rANS-encode the rANS
-      frequency tables themselves before writing the block header. Tables are sparse
-      (many zero entries) and highly compressible. This unlocks larger context tables
-      without header overhead penalty. Expected: enables D2/D3 at no extra cost.
+- [x] **D1** Compact frequency-table codec (bitmap + varint). 32-byte bitmap of
+      nonzero entries followed by varint-encoded freqs (1 B for f<128, 2 B else).
+      Raw freq tables were 512 B each × 21 = 10.5 KB / block; typical compact is
+      100-250 B / table → ~6-8 KB saved / block.
+      **Result: −0.17 / −0.53 / −0.24 pts ntdll/kernel32/user32 (2026-04-22).**
+      kernel32 (836 KB single block) benefited most since header overhead was the
+      largest fraction there.
 
 - [ ] **D2** Order-1 literal model (256 contexts, condition on full prev byte).
       Currently: 16–32 contexts (top 4–5 bits only). Full order-1 = 256 sub-streams.
@@ -204,6 +207,10 @@ Estimated total gain: highly implementation-dependent
 - **N_LIT_CTX 16→32 at 4 MB blocks**: retried A3 hoping larger blocks amortized header.
   Still regressed: ntdll +0.08, kernel32 +0.71, user32 +0.27. kernel32 (836 KB) is
   sub-block so overhead fraction is unchanged. Reverted.
+- **N_LIT_CTX 16→32 after D1 (2026-04-22)**: retried with compact freq tables.
+  Mixed: ntdll −0.06, kernel32 +0.33, user32 +0.10. 16 extra compact tables × ~150 B
+  = 2.4 KB = 0.29% header overhead on kernel32 (836 KB), exactly matching the
+  regression. Reverted — kernel32 is still the bottleneck for extra contexts.
 
 ---
 

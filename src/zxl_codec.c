@@ -98,6 +98,68 @@
 #define MAX_LIT_RUN 244   /* max literal bytes per run token (token 0x00..0xF3) */
 
 /* ------------------------------------------------------------------ */
+/* D1: Compact rANS frequency-table codec (bitmap + varint)           */
+/* ------------------------------------------------------------------ */
+/*
+ * Raw layout was 256 × u16 = 512 B / table. Freq tables are sparse
+ * (many zero entries) and most nonzero values are small. Compact layout:
+ *   [32 B] bitmap — bit i = 1 iff freq[i] != 0
+ *   For each set bit, varint-encoded freq:
+ *     f in [1,127]   → 1 byte: f (high bit 0)
+ *     f in [128,16383] → 2 bytes: (0x80 | (f>>8)), (f & 0xFF)
+ * RANS_SCALE is 16384 so freqs fit in 14 bits.
+ * Worst case: 32 + 256*2 = 544 B (vs 512 raw). Typical: 100-250 B.
+ */
+#define ZXL_COMPACT_FREQ_MAX 544
+
+static size_t write_compact_freqs(uint8_t *dst, const RansSym syms[256])
+{
+    uint8_t *p = dst;
+    uint8_t *bitmap = p;
+    memset(bitmap, 0, 32);
+    p += 32;
+    for (int i = 0; i < 256; i++) {
+        uint16_t f = syms[i].freq;
+        if (f == 0) continue;
+        bitmap[i >> 3] |= (uint8_t)(1u << (i & 7));
+        if (f < 128u) {
+            *p++ = (uint8_t)f;
+        } else {
+            *p++ = (uint8_t)(0x80u | (f >> 8));
+            *p++ = (uint8_t)(f & 0xFFu);
+        }
+    }
+    return (size_t)(p - dst);
+}
+
+/* Returns bytes consumed, or 0 on error. Fills cnt[] with freqs. */
+static size_t read_compact_freqs(const uint8_t *src, size_t avail, uint32_t cnt[256])
+{
+    if (avail < 32) return 0;
+    const uint8_t *p = src;
+    const uint8_t *bitmap = p;
+    p += 32;
+    const uint8_t *end = src + avail;
+    for (int i = 0; i < 256; i++) {
+        if ((bitmap[i >> 3] >> (i & 7)) & 1u) {
+            if (p >= end) return 0;
+            uint8_t b = *p++;
+            uint32_t f;
+            if ((b & 0x80u) == 0) {
+                f = b;
+            } else {
+                if (p >= end) return 0;
+                f = ((uint32_t)(b & 0x7Fu) << 8) | (uint32_t)(*p++);
+            }
+            cnt[i] = f;
+        } else {
+            cnt[i] = 0;
+        }
+    }
+    return (size_t)(p - src);
+}
+
+/* ------------------------------------------------------------------ */
 /* x64 RIP-relative BCJ filter                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1212,7 +1274,8 @@ static size_t compress_block(MatchCtx *ctx,
      *   enc_am == 0 → raw fallback (literal copy at offset 60)
      */
     #define N_HDR_FIELDS 15
-    size_t hdr_size = 4*N_HDR_FIELDS + 256*2*6 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
+    /* Worst-case compact freq tables (D1): ZXL_COMPACT_FREQ_MAX per table. */
+    size_t hdr_size = 4*N_HDR_FIELDS + ZXL_COMPACT_FREQ_MAX*(6 + N_LIT_CTX) + N_LIT_CTX*4*2;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
     size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
@@ -1254,14 +1317,15 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [13] dec_len */
     write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
-    for (int i = 0; i < 256; i++) { write_u16(p, am_syms[i].freq);       p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, al_syms[i].freq);       p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, off_lo_syms[i].freq);   p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, off_hi_syms[i].freq);   p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, delta_syms[i].freq);    p += 2; }
-    for (int i = 0; i < 256; i++) { write_u16(p, len_syms[i].freq);      p += 2; }
+    /* D1: compact (bitmap + varint) freq tables. */
+    p += write_compact_freqs(p, am_syms);
+    p += write_compact_freqs(p, al_syms);
+    p += write_compact_freqs(p, off_lo_syms);
+    p += write_compact_freqs(p, off_hi_syms);
+    p += write_compact_freqs(p, delta_syms);
+    p += write_compact_freqs(p, len_syms);
     for (int c = 0; c < N_LIT_CTX; c++)
-        for (int i = 0; i < 256; i++) { write_u16(p, lit_syms_ctx[c][i].freq); p += 2; }
+        p += write_compact_freqs(p, lit_syms_ctx[c]);
     for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_enc_sz[c]);  p += 4; }
     for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_sub_len[c]); p += 4; }
 
@@ -1340,58 +1404,60 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
         return lit_size;
     }
 
-    /* Header: N_HDR_FIELDS uint32 + 6 freq tables + N_LIT_CTX lit_tables + 2×N_LIT_CTX sizes */
-    size_t hdr = raw_hdr_d + 256*2*6 + N_LIT_CTX*256*2 + N_LIT_CTX*4*2;
-    if (src_len < hdr + opcode_am_size + opcode_al_size
-                      + off_lo_size + off_hi_size + delta_size + len_size + lit_size) return 0;
-
+    /* D1 compact freq tables: sizes are variable. We use a bounds-check on each
+     * read rather than a precomputed hdr size, and then sanity-check remaining. */
     const uint8_t *tp = src + raw_hdr_d;
+    const uint8_t *tp_end = src + src_len;
+
+    #define READ_COMPACT_FREQS_INTO(syms_arr, slots_arr)                         \
+        do {                                                                       \
+            uint32_t _cnt[256];                                                    \
+            size_t _consumed = read_compact_freqs(tp, (size_t)(tp_end - tp), _cnt); \
+            if (_consumed == 0) return 0;                                          \
+            tp += _consumed;                                                       \
+            rans_build_tables(_cnt, (syms_arr), (slots_arr));                      \
+        } while (0)
 
     /* Two opcode freq tables: am, al */
     RansSym  am_syms[256];  RansSlot am_slots[RANS_SCALE];
-    { uint32_t cnt[256]={0}; for(int i=0;i<256;i++){am_syms[i].freq=read_u16(tp);cnt[i]=am_syms[i].freq;tp+=2;}
-      rans_build_tables(cnt,am_syms,am_slots); }
+    READ_COMPACT_FREQS_INTO(am_syms, am_slots);
     RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
-    { uint32_t cnt[256]={0}; for(int i=0;i<256;i++){al_syms[i].freq=read_u16(tp);cnt[i]=al_syms[i].freq;tp+=2;}
-      rans_build_tables(cnt,al_syms,al_slots); }
+    READ_COMPACT_FREQS_INTO(al_syms, al_slots);
 
-    /* Offset-lo freq table */
+    /* Offset-lo / offset-hi / delta / len freq tables */
     RansSym  off_lo_syms_d[256];  RansSlot off_lo_slots_d[RANS_SCALE];
-    { uint32_t cnt[256] = {0};
-      for (int i = 0; i < 256; i++) { off_lo_syms_d[i].freq = read_u16(tp); cnt[i] = off_lo_syms_d[i].freq; tp += 2; }
-      rans_build_tables(cnt, off_lo_syms_d, off_lo_slots_d); }
-
-    /* Offset-hi freq table */
+    READ_COMPACT_FREQS_INTO(off_lo_syms_d, off_lo_slots_d);
     RansSym  off_hi_syms_d[256];  RansSlot off_hi_slots_d[RANS_SCALE];
-    { uint32_t cnt[256] = {0};
-      for (int i = 0; i < 256; i++) { off_hi_syms_d[i].freq = read_u16(tp); cnt[i] = off_hi_syms_d[i].freq; tp += 2; }
-      rans_build_tables(cnt, off_hi_syms_d, off_hi_slots_d); }
-
-    /* Delta freq table (mtype+deltaval bytes) */
+    READ_COMPACT_FREQS_INTO(off_hi_syms_d, off_hi_slots_d);
     RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
-    { uint32_t cnt[256] = {0};
-      for (int i = 0; i < 256; i++) { delta_syms[i].freq = read_u16(tp); cnt[i] = delta_syms[i].freq; tp += 2; }
-      rans_build_tables(cnt, delta_syms, delta_slots); }
-
-    /* Len freq table (match length bytes) */
+    READ_COMPACT_FREQS_INTO(delta_syms, delta_slots);
     RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
-    { uint32_t cnt[256] = {0};
-      for (int i = 0; i < 256; i++) { len_syms[i].freq = read_u16(tp); cnt[i] = len_syms[i].freq; tp += 2; }
-      rans_build_tables(cnt, len_syms, len_slots); }
+    READ_COMPACT_FREQS_INTO(len_syms, len_slots);
+
+    #undef READ_COMPACT_FREQS_INTO
 
     /* N_LIT_CTX literal freq tables → slot tables on heap */
     RansSlot *lit_slots_all = (RansSlot *)malloc(N_LIT_CTX * RANS_SCALE * sizeof(RansSlot));
     if (!lit_slots_all) return 0;
     for (int c = 0; c < N_LIT_CTX; c++) {
-        RansSym  syms[256];  uint32_t cnt[256] = {0};
-        for (int i = 0; i < 256; i++) { syms[i].freq = read_u16(tp); cnt[i] = syms[i].freq; tp += 2; }
+        RansSym  syms[256];  uint32_t cnt[256];
+        size_t consumed = read_compact_freqs(tp, (size_t)(tp_end - tp), cnt);
+        if (consumed == 0) { free(lit_slots_all); return 0; }
+        tp += consumed;
         rans_build_tables(cnt, syms, lit_slots_all + c * RANS_SCALE);
     }
+
+    /* Bounds check: lit-size tables + all streams must fit */
+    size_t need = (size_t)(N_LIT_CTX * 4 * 2)
+                + opcode_am_size + opcode_al_size
+                + off_lo_size + off_hi_size + delta_size + len_size + lit_size;
+    if ((size_t)(tp_end - tp) < need) { free(lit_slots_all); return 0; }
 
     uint32_t lit_enc_sz[N_LIT_CTX], lit_dec_sz[N_LIT_CTX];
     for (int c = 0; c < N_LIT_CTX; c++) { lit_enc_sz[c] = read_u32(tp); tp += 4; }
     for (int c = 0; c < N_LIT_CTX; c++) { lit_dec_sz[c] = read_u32(tp); tp += 4; }
 
+    size_t hdr_consumed = (size_t)(tp - src);  /* total variable header size */
     const uint8_t *opcode_am_stream = tp;
     const uint8_t *opcode_al_stream = tp + opcode_am_size;
     size_t op2 = opcode_am_size + opcode_al_size;
@@ -1640,7 +1706,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     if (len_buf)   free(len_buf);
     free(lit_flat);
 
-    *consumed = hdr + opcode_am_size + opcode_al_size
+    *consumed = hdr_consumed + opcode_am_size + opcode_al_size
                     + off_lo_size + off_hi_size + delta_size + len_size + lit_size;
     return out_pos - global_out_pos;
 }
