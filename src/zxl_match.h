@@ -61,12 +61,15 @@ typedef struct {
     uint32_t adiff_ht  [ZXL_HASH_SIZE];
     uint32_t short_ht  [ZXL_HASH_SIZE];  /* 3-byte hash for TOK_EXACT0 short matches */
     uint32_t long_ht   [ZXL_HASH_SIZE];  /* 8-byte hash for long-match candidates (B4) */
+    uint32_t bt_root   [ZXL_HASH_SIZE];  /* B1 binary-tree root per hash bucket (scaffold) */
 
     uint32_t exact_next[ZXL_WINDOW];
     uint32_t xdiff_next[ZXL_WINDOW];
     uint32_t adiff_next[ZXL_WINDOW];
     uint32_t short_next[ZXL_WINDOW];
     uint32_t long_next [ZXL_WINDOW];
+    uint32_t bt_left   [ZXL_WINDOW];     /* B1 tree: smaller-suffix child (scaffold)  */
+    uint32_t bt_right  [ZXL_WINDOW];     /* B1 tree: larger-suffix child  (scaffold)  */
 } MatchCtx;
 
 /*
@@ -110,5 +113,31 @@ int match_find(MatchCtx *ctx,
 
 /* Insert position pos into all hash chains. */
 void match_update(MatchCtx *ctx, const uint8_t *src, size_t src_len, uint32_t pos);
+
+/*
+ * B1 binary-tree match finder (SCAFFOLD — not wired into match_find yet).
+ *
+ * Design: one binary tree per hash bucket, keyed by the string starting at
+ * each position (lexicographic on the raw bytes). Insertion walks from root
+ * comparing bytes at the candidate against bytes at `pos`, splitting the tree
+ * into two subtrees at the insertion point:
+ *   bt_left[pos]  receives the subtree of all refs where ref-string < cur-string
+ *   bt_right[pos] receives the subtree of all refs where ref-string > cur-string
+ * Insertion therefore also enumerates every ancestor as a match candidate,
+ * so one pass gives us optimal-length matches in O(log n) expected.
+ *
+ * This function combines insert + find: after the call, bt_root[h] points to
+ * `pos`, and *best_length / *best_offset carry the longest match seen along
+ * the insertion path.
+ *
+ * Returns 1 if a match with length >= ZXL_MIN_MATCH was found, else 0.
+ * Currently stubbed to return 0 so the main parser keeps using the hash-chain
+ * path; body will be filled in the next session.
+ */
+int bt_insert_and_find(MatchCtx *ctx,
+                       const uint8_t *src, size_t src_len,
+                       uint32_t pos,
+                       uint32_t *best_offset,
+                       uint32_t *best_length);
 
 #endif /* ZXL_MATCH_H */

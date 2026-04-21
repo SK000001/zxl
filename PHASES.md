@@ -63,9 +63,15 @@ Estimated total gain: −3 to −5 pts
 **Target: ntdll < 0.425 (currently 0.4474, gap ~22 pts)**
 Estimated total gain: −5 to −10 pts on top of Phase 1
 
-- [ ] **B1** Binary-tree hash chains (btree4). Replace singly-linked hash chains with
-      binary trees sorted by position. Enables O(n log n) best-match search across
-      the full window. Expected: −0.5 to −1.5 pts.
+- [~] **B1** Binary-tree hash chains (btree4). Replace singly-linked hash chains with
+      binary trees sorted by suffix (lexicographic). Enables O(log n) best-match
+      search across the full window. Expected: −0.5 to −1.5 pts.
+      **IN PROGRESS — scaffold only (2026-04-22).** `bt_root[ZXL_HASH_SIZE]`,
+      `bt_left[ZXL_WINDOW]`, `bt_right[ZXL_WINDOW]` arrays added to MatchCtx; stub
+      `bt_insert_and_find()` returns 0. No behavior change yet. Next session: fill
+      LZMA-style insert+search body (single pass descends tree comparing bytes, splits
+      at insertion point, tracks longest match along path), then wire into match_find
+      as primary exact-match source.
 
 - [x] **B2** 3-byte minimum match (MIN_MATCH 4 → 3). Added TOK_EXACT0 (3-byte exact
       match, 1-byte offset, implicit length 3, no length/rep update). New 3-gram

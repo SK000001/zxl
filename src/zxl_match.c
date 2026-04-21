@@ -189,7 +189,34 @@ static uint32_t extend_add(const uint8_t *a, const uint8_t *b,
 
 void match_ctx_init(MatchCtx *ctx)
 {
-    memset(ctx, 0xFF, sizeof(*ctx));  /* 0xFFFFFFFF = "no entry" sentinel */
+    /* 0xFFFFFFFF is the "no entry" sentinel for every table and chain-next
+     * slot, including the binary-tree roots and child pointers (B1 scaffold). */
+    memset(ctx, 0xFF, sizeof(*ctx));
+}
+
+/*
+ * B1 scaffold: signature-correct stub. The real implementation (next session)
+ * walks the per-hash-bucket binary tree rooted at ctx->bt_root[h], comparing
+ * bytes at `pos` against bytes at each visited node to descend left/right,
+ * simultaneously splitting the tree so `pos` becomes a new leaf whose
+ * bt_left/bt_right children are the subtrees of smaller/larger suffixes.
+ * Every ancestor visited is a match candidate, so the longest match along
+ * the path is the optimal-length match in the tree.
+ *
+ * Until the body is filled in, we return 0 (no match) so match_find keeps
+ * using the hash-chain path — this lets us commit the scaffolding without
+ * changing behavior.
+ */
+int bt_insert_and_find(MatchCtx *ctx,
+                       const uint8_t *src, size_t src_len,
+                       uint32_t pos,
+                       uint32_t *best_offset,
+                       uint32_t *best_length)
+{
+    (void)ctx; (void)src; (void)src_len; (void)pos;
+    if (best_offset) *best_offset = 0;
+    if (best_length) *best_length = 0;
+    return 0;
 }
 
 /*
