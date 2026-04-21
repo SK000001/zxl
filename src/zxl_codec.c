@@ -624,6 +624,32 @@ static size_t compress_block(MatchCtx *ctx,
             match_update(ctx, src, (size_t)end_pos, p);
             Match tmp[ZXL_MAX_CANDIDATES];
             int n = match_find(ctx, src, (size_t)end_pos, p, tmp);
+
+            /* B1: binary-tree find + insert. Walks the per-hash-bucket
+             * suffix tree and returns the best-length exact match on the
+             * descent path. Added as an extra candidate only if it beats
+             * every match the hash chains found. */
+            uint32_t bt_off = 0, bt_len = 0;
+            if (bt_insert_and_find(ctx, src, (size_t)end_pos, p, &bt_off, &bt_len)) {
+                uint32_t best_chain_len = 0;
+                int      weakest_idx    = 0;
+                uint32_t weakest_len    = 0xFFFFFFFFu;
+                for (int c = 0; c < n; c++) {
+                    if (tmp[c].length > best_chain_len) best_chain_len = tmp[c].length;
+                    if (tmp[c].length < weakest_len) { weakest_len = tmp[c].length; weakest_idx = c; }
+                }
+                if (bt_len > best_chain_len) {
+                    if (n < ZXL_MAX_CANDIDATES) {
+                        tmp[n].offset = bt_off; tmp[n].length = bt_len;
+                        tmp[n].mtype  = MTYPE_EXACT; tmp[n].delta = 0;
+                        n++;
+                    } else {
+                        tmp[weakest_idx].offset = bt_off; tmp[weakest_idx].length = bt_len;
+                        tmp[weakest_idx].mtype  = MTYPE_EXACT; tmp[weakest_idx].delta = 0;
+                    }
+                }
+            }
+
             found_arr[i] = (uint8_t)n;
             for (int c = 0; c < n; c++)
                 match_all[i * ZXL_MAX_CANDIDATES + c] = tmp[c];

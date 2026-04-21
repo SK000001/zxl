@@ -195,17 +195,22 @@ void match_ctx_init(MatchCtx *ctx)
 }
 
 /*
- * B1 scaffold: signature-correct stub. The real implementation (next session)
- * walks the per-hash-bucket binary tree rooted at ctx->bt_root[h], comparing
- * bytes at `pos` against bytes at each visited node to descend left/right,
- * simultaneously splitting the tree so `pos` becomes a new leaf whose
- * bt_left/bt_right children are the subtrees of smaller/larger suffixes.
- * Every ancestor visited is a match candidate, so the longest match along
- * the path is the optimal-length match in the tree.
+ * B1: binary-tree match finder (LZMA BT4-style).
  *
- * Until the body is filled in, we return 0 (no match) so match_find keeps
- * using the hash-chain path — this lets us commit the scaffolding without
- * changing behavior.
+ * Single pass performs both INSERT (make `pos` the new root, split the old
+ * tree around it) and FIND (track longest match along the descent path).
+ *
+ * Invariants:
+ *   - bt_left[s]  / bt_right[s] are the children of whichever position was
+ *     most recently stored at window slot s = pos & WINDOW_MASK.
+ *   - Slot reuse (when pos wraps) can leave stale child pointers dangling.
+ *     We defend against this by bounding offset to <= ZXL_MAX_OFFSET on
+ *     every descent step; stale refs usually fall out of window and are
+ *     truncated with a SENTINEL write.
+ *   - `len_s` / `len_l` track the shared-prefix length along the smaller
+ *     / larger descent paths — every future node on that path shares at
+ *     least min(len_s, len_l) bytes with `pos`, so byte comparison can
+ *     resume from that offset rather than restart.
  */
 int bt_insert_and_find(MatchCtx *ctx,
                        const uint8_t *src, size_t src_len,
@@ -213,10 +218,75 @@ int bt_insert_and_find(MatchCtx *ctx,
                        uint32_t *best_offset,
                        uint32_t *best_length)
 {
-    (void)ctx; (void)src; (void)src_len; (void)pos;
     if (best_offset) *best_offset = 0;
     if (best_length) *best_length = 0;
-    return 0;
+    if ((size_t)pos + ZXL_MIN_MATCH > src_len) return 0;
+
+    uint32_t max_len = (uint32_t)(src_len - pos);
+    if (max_len > ZXL_MAX_MATCH) max_len = ZXL_MAX_MATCH;
+
+    uint32_t h = hash_exact(src + pos);
+    uint32_t node = ctx->bt_root[h];  /* old root before insert */
+    ctx->bt_root[h] = pos;             /* cur becomes new root    */
+
+    uint32_t cur_slot = pos & (ZXL_WINDOW - 1u);
+    uint32_t *ptr_s = &ctx->bt_left [cur_slot];  /* receives smaller subtree */
+    uint32_t *ptr_l = &ctx->bt_right[cur_slot];  /* receives larger  subtree */
+
+    uint32_t len_s = 0, len_l = 0;
+    uint32_t best_len = 0, best_off = 0;
+    int terminated = 0;
+
+    for (int depth = ZXL_CHAIN_DEPTH; depth > 0; depth--) {
+        /* Invalid / out-of-window node: truncate both subtrees here. */
+        if (node == 0xFFFFFFFFu || pos <= node || (pos - node) > ZXL_MAX_OFFSET) {
+            *ptr_s = *ptr_l = 0xFFFFFFFFu;
+            terminated = 1;
+            break;
+        }
+
+        uint32_t off = pos - node;
+        uint32_t node_slot = node & (ZXL_WINDOW - 1u);
+
+        /* Resume byte comparison from the known-shared prefix. */
+        uint32_t n = (len_s < len_l) ? len_s : len_l;
+        const uint8_t *pc = src + pos;
+        const uint8_t *pn = src + node;
+        while (n < max_len && pc[n] == pn[n]) n++;
+
+        if (n > best_len) { best_len = n; best_off = off; }
+
+        if (n == max_len) {
+            /* Full match: cur's suffix equals node's suffix — cannot split.
+             * Both subtrees of node must be copied through to cur. */
+            *ptr_s = ctx->bt_left [node_slot];
+            *ptr_l = ctx->bt_right[node_slot];
+            terminated = 1;
+            break;
+        }
+
+        if (pn[n] < pc[n]) {
+            /* node's suffix is smaller than cur's — it belongs in our
+             * smaller subtree; descend to node's larger subtree. */
+            *ptr_s = node;
+            ptr_s = &ctx->bt_right[node_slot];
+            node  = ctx->bt_right[node_slot];
+            len_s = n;
+        } else {
+            *ptr_l = node;
+            ptr_l = &ctx->bt_left[node_slot];
+            node  = ctx->bt_left[node_slot];
+            len_l = n;
+        }
+    }
+    if (!terminated) {
+        /* Depth exhausted: terminate the two still-open subtree pointers. */
+        *ptr_s = *ptr_l = 0xFFFFFFFFu;
+    }
+
+    if (best_offset) *best_offset = best_off;
+    if (best_length) *best_length = best_len;
+    return best_len >= ZXL_MIN_MATCH;
 }
 
 /*
