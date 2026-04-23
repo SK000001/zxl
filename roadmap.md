@@ -5,17 +5,17 @@ Replaces the old PHASES.md (folded in here).
 
 ---
 
-## Current state (2026-04-24)
+## Current state (2026-04-24, post B5)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------|--------|--------|---------|---------|--------|
-| ntdll.dll    | 0.4167 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
+| ntdll.dll    | 0.4110 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
 | kernel32.dll | 0.4252 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
-| user32.dll   | 0.3471 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
+| user32.dll   | 0.3427 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
 
 - Beats gzip-9, zstd-9, bzip2-9 on all three files.
-- Gap to zstd-19: **+1.54 / +2.28 / +1.59 pts.**
-- Gap to xz-9e: +3.95 / +4.67 / +4.06 pts.
+- Gap to zstd-19: **+0.97 / +2.28 / +1.15 pts** — ntdll is within 1 pt of zstd-19.
+- Gap to xz-9e: +3.38 / +4.67 / +3.62 pts.
 
 ---
 
@@ -34,6 +34,7 @@ Format tricks:
 - LRU-5 REP offsets, variable-length offset classes (EXACT1/2/3, DELTA1/2/3), TOK_EXACT0 for 3-byte local matches.
 - x86 BCJ filter, x64 RIP-relative BCJ filter, C2 IAT delta filter.
 - D1 compact freq tables (bitmap + varint) — cuts per-block header ~10 KB → ~3 KB.
+- B5 PE-section-aware block boundaries — parses PE section table and forces block splits at section starts (guarded by 512 KB min-block). Each block's freq tables specialize to one section's statistics.
 
 ---
 
@@ -51,18 +52,7 @@ Don't forget these or we'll waste sessions re-learning them:
 
 ## Roadmap — next sessions
 
-### Session N+1 — B5 content-adaptive block boundaries
-**Branch:** `feat/b5-pe-blocks` · **Expected:** −0.2 to −0.5 pts on multi-section files.
-
-Parse PE headers (DOS → PE → section table), emit forced block splits at section boundaries so each block's freq tables specialize to one section's stats. No format change — blocks are already self-describing; only layout shifts.
-
-Guards: don't split if resulting block < 256 KB (D1 overhead floor); only active when MZ magic is present.
-
-Failure modes: very small sections creating starved blocks; cross-section matches getting truncated (acceptable — window still carries).
-
----
-
-### Session N+2 — Low-rank factored freq tables (the novel math bet)
+### Session N+1 — Low-rank factored freq tables (the novel math bet)
 **Branch:** `feat/lowrank-freqs` · **Expected:** −0.3 to −0.8 pts, and structurally unblocks D2.
 
 A 256-bin frequency table usually isn't a free distribution — it factors close to a product of a 16-bin high-nibble distribution and a 16-bin low-nibble distribution. Parameterize as an outer product (32 values → reconstruct 256) or as a rank-k tensor for higher-context tables.
@@ -75,7 +65,7 @@ I haven't seen this in any production codec. Closest analogue is tensor-factoriz
 
 ---
 
-### Session N+3 — Semantic typed streams
+### Session N+2 — Semantic typed streams
 **Branch:** `feat/typed-streams` · **Expected:** −0.5 to −1.0 pts on PE.
 
 Partition each block's bytes into semantic streams before LZ/rANS:
@@ -93,7 +83,7 @@ Requires a minimal x86 decoder (opcode → length). Multi-week but structurally 
 
 ---
 
-### Session N+4 — Cross-DLL shared dictionary
+### Session N+3 — Cross-DLL shared dictionary
 **Branch:** `feat/crossdll-dict` · **Expected:** −1.0 to −2.0 pts when compressing multiple DLLs together.
 
 ntdll / kernel32 / user32 share boilerplate: SEH prologues, import stubs, standard epilogue patterns. kernel32 forwards many exports to ntdll. When compressed together, a shared prefix dictionary (concat or learned) gives each file a warm match window instead of starting cold.
@@ -104,7 +94,7 @@ Closest public analogue is zstd's `--train` dictionaries — but those are gener
 
 ---
 
-### Session N+5+ — Semi-adaptive rANS as a fallback path
+### Session N+4+ — Semi-adaptive rANS as a fallback path
 **Branch:** `feat/semi-adaptive-rans` · **Expected:** −0.3 to −0.8 pts.
 
 If low-rank freq tables don't pan out, fall back to semi-adaptive: transmit freq tables once per block as today, then mid-block emit small freq deltas every ~256 KB to track distribution drift. Captures section-boundary drift without a full rewrite to per-symbol adaptation.
