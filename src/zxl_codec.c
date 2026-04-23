@@ -57,6 +57,7 @@
 /* File-level flags stored in the 4-byte flags field of the header */
 #define ZXL_FLAG_BCJ   0x01u  /* x86 BCJ (E8/E9) filter was applied */
 #define ZXL_FLAG_BCJ64 0x02u  /* x64 RIP-relative BCJ filter was applied */
+#define ZXL_FLAG_IAT   0x04u  /* C2 64-bit IAT delta filter was applied */
 
 /*
  * Token byte values (ZXLC):
@@ -443,6 +444,67 @@ static void bcj_x86_inverse(uint8_t *buf, size_t len)
         }
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* C2: 64-bit IAT delta filter                                        */
+/* ------------------------------------------------------------------ */
+/*
+ * 64-bit PE import/jump tables and vtables are long runs of 8-byte
+ * absolute pointers clustered in a narrow address range (same DLL or
+ * same module), so most entries share the top 5+ bytes and only the
+ * low bytes vary.
+ *
+ * Detection is self-consistent: we match 8-byte-aligned entries where
+ * the top 3 bytes look like a user-mode 64-bit pointer
+ * (byte[7] == 0 && byte[6] == 0 && byte[5] <= 0x7F). This pattern is
+ * preserved by XOR of two values both in the same pattern (0^0 = 0,
+ * and [0..0x7F] XOR [0..0x7F] stays in [0..0x7F]), so the encoder can
+ * scan original data and the decoder can scan the same run boundaries
+ * on the transformed data without a side-channel flag.
+ *
+ * Transform: XOR only the low 5 bytes (indices 0..4). Top 3 bytes
+ * (indices 5..7) are untouched, preserving the detection signature.
+ *
+ * The stricter 3-byte pattern sharply reduces false positives over a
+ * bare byte[7]==0 check, which collided with BCJ-transformed absolute
+ * addresses whose 4-byte result frequently has byte[7]==0 at random
+ * 8-byte boundaries.
+ *
+ * Encode XORs right-to-left (referencing still-original neighbors);
+ * decode XORs left-to-right (each predecessor has already been
+ * restored when used).
+ */
+#define IAT_RUN_MIN 80
+#define IAT_MATCH(p) ((p)[7] == 0 && (p)[6] == 0 && (p)[5] <= 0x7Fu)
+
+static void iat_filter_scan(uint8_t *buf, size_t len, int encode)
+{
+    size_t i = 0;
+    while (i + 8 <= len) {
+        if (!IAT_MATCH(buf + i)) { i += 8; continue; }
+        size_t run_start = i;
+        size_t run_count = 0;
+        while (i + 8 <= len && IAT_MATCH(buf + i)) { run_count++; i += 8; }
+        if (run_count < IAT_RUN_MIN) continue;
+
+        if (encode) {
+            for (size_t j = run_count - 1; j >= 1; j--) {
+                uint8_t *a = buf + run_start + j * 8;
+                const uint8_t *b = a - 8;
+                a[0] ^= b[0]; a[1] ^= b[1]; a[2] ^= b[2]; a[3] ^= b[3]; a[4] ^= b[4];
+            }
+        } else {
+            for (size_t j = 1; j < run_count; j++) {
+                uint8_t *a = buf + run_start + j * 8;
+                const uint8_t *b = a - 8;
+                a[0] ^= b[0]; a[1] ^= b[1]; a[2] ^= b[2]; a[3] ^= b[3]; a[4] ^= b[4];
+            }
+        }
+    }
+}
+
+static inline void iat_forward(uint8_t *buf, size_t len) { iat_filter_scan(buf, len, 1); }
+static inline void iat_inverse(uint8_t *buf, size_t len) { iat_filter_scan(buf, len, 0); }
 
 /* ------------------------------------------------------------------ */
 /* Helpers: little-endian I/O                                         */
@@ -1761,8 +1823,9 @@ int zxl_compress(const uint8_t *src, size_t src_len,
             memcpy(bcj_buf, src, src_len);
             bcj_x64_forward(bcj_buf, src_len);  /* x64 RIP-relative first */
             bcj_x86_forward(bcj_buf, src_len);  /* then x86 E8/E9/Jcc */
+            iat_forward(bcj_buf, src_len);      /* C2: IAT delta filter */
             work  = bcj_buf;
-            flags = ZXL_FLAG_BCJ | ZXL_FLAG_BCJ64;
+            flags = ZXL_FLAG_BCJ | ZXL_FLAG_BCJ64 | ZXL_FLAG_IAT;
         }
     }
 
@@ -1837,7 +1900,9 @@ int zxl_decompress(const uint8_t *src, size_t src_len,
         p += blk_comp;
     }
 
-    /* Undo BCJ filters in reverse order of application */
+    /* Undo filters in reverse order of application (IAT → BCJ_x86 → BCJ_x64). */
+    if (flags & ZXL_FLAG_IAT)
+        iat_inverse(dst, out_pos);
     if (flags & ZXL_FLAG_BCJ)
         bcj_x86_inverse(dst, out_pos);
     if (flags & ZXL_FLAG_BCJ64)
