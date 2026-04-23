@@ -101,7 +101,7 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
 - [ ] **B5** Content-adaptive block boundaries. Detect PE section boundaries
       (`.text`, `.data`, `.rdata`, `.rsrc`) and use them as block split points.
       Different sections have different statistics; cross-section pollution hurts models.
-      Expected: −0.2 to −0.5 pts.
+      Expected: −0.2 to −0.5 pts on multi-section files. Planned for session after C2.
 
 - [x] **C1** x64 BCJ filter: RIP-relative addressing (64-bit PE files).
       `MOV rax, [rip+X]`, `LEA rax, [rip+X]` → convert to absolute addresses.
@@ -109,9 +109,10 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       Plus 0F-prefixed SSE/CMOV variants and 0x83/0xC7/0xF7 immediate-group ops.
       **Result: −0.70/−0.34/−0.58 pts ntdll/kernel32/user32 (2026-04-20)**
 
-- [ ] **C2** Import table delta filter. IAT entries are 8-byte (64-bit) pointers
-      clustered near each other. Apply delta encoding on the IAT section.
-      Expected: −0.1 to −0.4 pts.
+- [ ] **C2** Import table (IAT) delta filter. 64-bit PE import tables are clustered
+      8-byte absolute pointers, typically varying only in low bits. Apply a delta pass
+      before matching, reconstruct in the decoder. Analogous to BCJ/C1 pattern.
+      Expected: −0.1 to −0.3 pts on PE files; no effect on non-PE. **NEXT.**
 
 ---
 
@@ -127,10 +128,14 @@ Estimated total gain: −10 to −20 pts on top of Phase 2
       kernel32 (836 KB single block) benefited most since header overhead was the
       largest fraction there.
 
-- [ ] **D2** Order-1 literal model (256 contexts, condition on full prev byte).
-      Currently: 16–32 contexts (top 4–5 bits only). Full order-1 = 256 sub-streams.
-      Requires D1 (compressed tables) to keep header overhead acceptable.
-      Expected: −2 to −4 pts.
+- [~] **D2** Order-1 literal model (256 contexts, condition on full prev byte).
+      **BLOCKED at current block sizes.** Even with D1's compact freq tables, kernel32
+      (836 KB single block) cannot absorb the 16-context-expansion header overhead.
+      Rationale: 16 extra tables × ~150 B = 2.4 KB / block = 0.29% overhead on
+      kernel32, which exactly matches the observed regression. Unblock requires
+      either (a) adaptive rANS (no per-block header), (b) block-adaptive context
+      count signaled per-block, or (c) PE-section-aware blocks that give each
+      sub-stream a larger denominator.
 
 - [ ] **D3** Order-2 literal context (prev 2 bytes → 256 contexts via hash mixing).
       Combine top bits of prev byte and prev-prev byte into a 256-bucket context.
@@ -225,6 +230,22 @@ Estimated total gain: highly implementation-dependent
   Mixed: ntdll −0.06, kernel32 +0.33, user32 +0.10. 16 extra compact tables × ~150 B
   = 2.4 KB = 0.29% header overhead on kernel32 (836 KB), exactly matching the
   regression. Reverted — kernel32 is still the bottleneck for extra contexts.
+- **ZXL_HASH_BITS 19→20 (2026-04-22)**: 1M hash buckets vs 512K. Zero ratio change —
+  collisions weren't the bottleneck. Reverted (kept memory footprint down).
+- **SHORT_DEPTH 64→256 (2026-04-22)**: zero change; 3-byte chain already bails at
+  offset≥256 and prefers smallest offset within cap. Reverted.
+- **Order-2 literal context (feat/order2-lit-context, 2026-04-24)**: replaced
+  `prev>>4` with Fibonacci hash of (prev1, prev2) into same 16 buckets. Regressed
+  +0.47/+0.44/+0.33 pts. The hash distributed byte pairs uniformly and destroyed
+  the x86-opcode-class grouping that `prev>>4` provides for free. Round-trip OK;
+  implementation correct, context function was the wrong call. Branch abandoned.
+- **Split length stream REP vs non-REP (feat/split-len-stream, 2026-04-24)**:
+  Routed REP-token lengths to a dedicated rANS stream with its own freq table.
+  Round-trip OK. Result: PE essentially flat (+0.01 / +0.02 / 0), small files
+  regressed +0.1 to +0.3 pts. The extra freq table + 2 header u32s per block
+  (~158 B) dominated on sub-500 KB inputs; modeling gain on PE was too small to
+  overcome it even at 4 MB blocks. Branch abandoned — at current block sizes, any
+  new per-block rANS model needs >0.3 pts of modeling gain just to break even.
 
 ---
 
@@ -236,3 +257,38 @@ Estimated total gain: highly implementation-dependent
 - [x] **B4 2-level hash** (above). **Result: −0.01 / 0 / −0.01 pts.**
 
 Combined session: −0.17 / 0 / −0.22 pts. ntdll moved from 0.4242 to 0.4225.
+
+---
+
+## Forward roadmap (from 2026-04-24)
+
+**Current ratios:** 0.4207 / 0.4250 / 0.3471.
+**Gap to zstd-19:** +1.94 / +2.26 / +1.59 pts.
+
+Three tuning experiments this week (N_LIT_CTX=32, order-2 context, length-stream
+split) all regressed or flattened. Lesson: adding per-block rANS sub-models at
+current block sizes requires >0.3 pts of modeling gain to overcome the ~150 B
+compact-freq-table overhead. The remaining gains must come from either
+(a) PE-specific preprocessing (no new freq tables), or (b) a fundamental
+entropy-model change (adaptive rANS) that removes per-block freq tables entirely.
+
+### Next (feat/c2-iat-filter) — expected −0.1 to −0.3 pts
+1. **C2 IAT delta filter** — preprocess 64-bit import tables to delta-code their
+   clustered 8-byte pointers before matching.
+2. **Intermediate DP candidate lengths** — add lengths 12, 16, 24, 48, 72, 160 to
+   the parser sweep for finer-grained match selection. Expected: −0.05 to −0.15 pts.
+
+### After that (feat/b5-pe-blocks) — expected −0.2 to −0.5 pts
+3. **B5 content-adaptive block boundaries** — split blocks at `.text`/`.rdata`/`.data`
+   boundaries so each block's freq tables specialize. Largest expected win remaining
+   from PE-specific work.
+
+### The big one (feat/adaptive-rans) — expected −0.5 to −1.5 pts
+4. **Adaptive rANS** — replace block-static freq tables with per-symbol adaptive
+   frequency updates. Removes per-block header cost ceiling that's blocked D2/D3
+   and the length-stream split. High complexity (~400 LOC), substantial rewrite.
+
+### Explicitly deprioritized
+- N_LIT_CTX ≠ 16 — proven trap until block size floor is lifted.
+- Deeper hash chains — BT already validated depth isn't the bottleneck.
+- More per-block rANS stream splits at current block sizes — overhead math fails.
