@@ -109,10 +109,16 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       Plus 0F-prefixed SSE/CMOV variants and 0x83/0xC7/0xF7 immediate-group ops.
       **Result: −0.70/−0.34/−0.58 pts ntdll/kernel32/user32 (2026-04-20)**
 
-- [ ] **C2** Import table (IAT) delta filter. 64-bit PE import tables are clustered
-      8-byte absolute pointers, typically varying only in low bits. Apply a delta pass
-      before matching, reconstruct in the decoder. Analogous to BCJ/C1 pattern.
-      Expected: −0.1 to −0.3 pts on PE files; no effect on non-PE. **NEXT.**
+- [x] **C2** Import table (IAT) delta filter. Detects runs of ≥80 consecutive
+      8-byte-aligned entries matching a user-mode 64-bit pointer signature
+      (byte[7]==0, byte[6]==0, byte[5]≤0x7F), then XOR-chains the low 5 bytes
+      so entries carry deltas instead of absolute addresses. Top 3 bytes are
+      untouched, which is the self-consistent detection invariant: encoder scans
+      original data, decoder scans transformed data, both see the same runs.
+      **Result: −0.40 / +0.02 / 0.00 pts ntdll/kernel32/user32 (2026-04-24).**
+      Tuning sweep on min-run-length showed 80 is the pareto-best; tighter (16)
+      maximized ntdll but regressed user32; looser (128) sacrificed ntdll gain
+      for zero regression. 80 balances.
 
 ---
 
@@ -262,8 +268,8 @@ Combined session: −0.17 / 0 / −0.22 pts. ntdll moved from 0.4242 to 0.4225.
 
 ## Forward roadmap (from 2026-04-24)
 
-**Current ratios:** 0.4207 / 0.4250 / 0.3471.
-**Gap to zstd-19:** +1.94 / +2.26 / +1.59 pts.
+**Current ratios (post-C2):** 0.4167 / 0.4252 / 0.3471.
+**Gap to zstd-19:** +1.54 / +2.28 / +1.59 pts.
 
 Three tuning experiments this week (N_LIT_CTX=32, order-2 context, length-stream
 split) all regressed or flattened. Lesson: adding per-block rANS sub-models at
@@ -272,11 +278,10 @@ compact-freq-table overhead. The remaining gains must come from either
 (a) PE-specific preprocessing (no new freq tables), or (b) a fundamental
 entropy-model change (adaptive rANS) that removes per-block freq tables entirely.
 
-### Next (feat/c2-iat-filter) — expected −0.1 to −0.3 pts
-1. **C2 IAT delta filter** — preprocess 64-bit import tables to delta-code their
-   clustered 8-byte pointers before matching.
-2. **Intermediate DP candidate lengths** — add lengths 12, 16, 24, 48, 72, 160 to
-   the parser sweep for finer-grained match selection. Expected: −0.05 to −0.15 pts.
+### Shipped this session (2026-04-24)
+1. **C2 IAT delta filter** — done, −0.40 pts on ntdll, flat elsewhere.
+2. **DP candidate lengths** — tried adding 9, 14, 80, 160 to the parser sweep;
+   zero ratio change. Existing granularity already sufficient. Branch abandoned.
 
 ### After that (feat/b5-pe-blocks) — expected −0.2 to −0.5 pts
 3. **B5 content-adaptive block boundaries** — split blocks at `.text`/`.rdata`/`.data`
