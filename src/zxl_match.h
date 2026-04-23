@@ -26,7 +26,7 @@
 #define ZXL_HASH_SIZE   (1u << ZXL_HASH_BITS)   /* 512 K buckets         */
 #define ZXL_HASH_MASK   (ZXL_HASH_SIZE - 1u)
 
-#define ZXL_CHAIN_DEPTH 4096        /* candidates checked per chain per match type */
+#define ZXL_CHAIN_DEPTH 256         /* BT covers long matches; chains just need local diversity */
 #define ZXL_WINDOW      (1u << 21)  /* sliding window: 2 MB                       */
 
 #define ZXL_MIN_MATCH   4

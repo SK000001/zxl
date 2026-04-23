@@ -74,10 +74,12 @@ Estimated total gain: −5 to −10 pts on top of Phase 1
       (from window wrap) are caught by offset-bounds check and truncated with
       sentinel writes. Wired into forward scan as an extra Match candidate only
       when bt's best length strictly exceeds every hash-chain candidate.
-      **Result: −0.01 / −0.01 / −0.02 pts (marginal — chain depth 4096 + B4 long-hash
-      already find most long matches).** Round-trip OK on all test files.
-      Next session: replace exact-chain with BT entirely and tune CHAIN_DEPTH for
-      the real BT4 win (expected −0.3 to −1.0 pts once chain redundancy removed).
+      **Result: −0.01 / −0.01 / −0.02 pts (marginal).** Round-trip OK on all files.
+      Same-session follow-up: tuned ZXL_CHAIN_DEPTH 4096 → 256 with BT alongside.
+      Ratio unchanged within 0.01 pts, ~20% faster encode. Not fully removing the
+      exact chain because it still distinguishes EXACT1 (small-offset) / EXACT2
+      (mid-offset) / longest-any candidates by offset class, which BT doesn't
+      separate. Chain at depth 256 + BT is the new equilibrium.
 
 - [x] **B2** 3-byte minimum match (MIN_MATCH 4 → 3). Added TOK_EXACT0 (3-byte exact
       match, 1-byte offset, implicit length 3, no length/rep update). New 3-gram
