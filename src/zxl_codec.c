@@ -507,6 +507,76 @@ static inline void iat_forward(uint8_t *buf, size_t len) { iat_filter_scan(buf, 
 static inline void iat_inverse(uint8_t *buf, size_t len) { iat_filter_scan(buf, len, 0); }
 
 /* ------------------------------------------------------------------ */
+/* B5: PE section-boundary block splits                               */
+/* ------------------------------------------------------------------ */
+/*
+ * Parse a 64-bit PE file's section table and return the set of file
+ * offsets at which each section's raw data begins. The compressor then
+ * forces a block split at each returned offset (subject to a minimum
+ * block-size guard) so each block's rANS freq tables specialize to one
+ * section's byte statistics (.text vs .rdata vs .data vs .rsrc, ...)
+ * rather than averaging across mismatched regimes.
+ *
+ * The function is tolerant of malformed PE data: any out-of-range read
+ * or nonsensical field size causes it to return 0 splits, leaving the
+ * compressor on its fixed-block-size path. Non-PE input (no "MZ" at
+ * offset 0) trivially returns 0.
+ *
+ * Returns number of splits written to out[] (0..max_splits). Splits
+ * are sorted ascending, deduplicated, and always strictly within
+ * (0, src_len).
+ */
+static size_t pe_section_splits(const uint8_t *src, size_t src_len,
+                                size_t *out, size_t max_splits)
+{
+    if (src_len < 0x40u) return 0;
+    if (src[0] != 0x4Du || src[1] != 0x5Au) return 0;  /* no "MZ" */
+
+    /* e_lfanew at offset 0x3C */
+    uint32_t pe_off = (uint32_t)src[0x3C]
+                    | ((uint32_t)src[0x3D] << 8)
+                    | ((uint32_t)src[0x3E] << 16)
+                    | ((uint32_t)src[0x3F] << 24);
+    if ((size_t)pe_off + 24u > src_len) return 0;
+    if (src[pe_off] != 'P' || src[pe_off+1] != 'E'
+        || src[pe_off+2] != 0 || src[pe_off+3] != 0) return 0;
+
+    const uint8_t *coff = src + pe_off + 4;         /* COFF file header */
+    uint16_t n_sections = (uint16_t)coff[2] | ((uint16_t)coff[3] << 8);
+    uint16_t opt_size   = (uint16_t)coff[16] | ((uint16_t)coff[17] << 8);
+    if (n_sections == 0 || n_sections > 96) return 0;  /* sanity */
+
+    size_t sec_off = (size_t)pe_off + 4u + 20u + (size_t)opt_size;
+    if (sec_off + (size_t)n_sections * 40u > src_len) return 0;
+
+    size_t count = 0;
+    for (uint16_t i = 0; i < n_sections && count < max_splits; i++) {
+        const uint8_t *hdr = src + sec_off + (size_t)i * 40u;
+        /* PointerToRawData at offset 20 inside section header (little-endian u32) */
+        uint32_t raw_ptr = (uint32_t)hdr[20]
+                         | ((uint32_t)hdr[21] << 8)
+                         | ((uint32_t)hdr[22] << 16)
+                         | ((uint32_t)hdr[23] << 24);
+        if (raw_ptr == 0 || (size_t)raw_ptr >= src_len) continue;  /* skip BSS-like */
+        out[count++] = (size_t)raw_ptr;
+    }
+
+    /* Insertion sort (n_sections is small, <= 96). */
+    for (size_t i = 1; i < count; i++) {
+        size_t v = out[i];
+        size_t j = i;
+        while (j > 0 && out[j-1] > v) { out[j] = out[j-1]; j--; }
+        out[j] = v;
+    }
+    /* Dedup in place. */
+    size_t w = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (w == 0 || out[w-1] != out[i]) out[w++] = out[i];
+    }
+    return w;
+}
+
+/* ------------------------------------------------------------------ */
 /* Helpers: little-endian I/O                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1843,10 +1913,35 @@ int zxl_compress(const uint8_t *src, size_t src_len,
     if (!ctx) { free(bcj_buf); return -1; }
     match_ctx_init(ctx);
 
+    /* B5: PE section-boundary splits. Each returned offset starts a
+     * section; forcing a block split there lets the block's rANS tables
+     * specialize to one section's statistics. */
+    #define ZXL_MAX_PE_SPLITS 96
+    #define ZXL_B5_MIN_BLOCK  (512u * 1024u)  /* guard: don't split if result < 512 KB */
+    size_t pe_splits[ZXL_MAX_PE_SPLITS];
+    size_t n_pe_splits = pe_section_splits(src, src_len, pe_splits, ZXL_MAX_PE_SPLITS);
+    size_t next_split_idx = 0;
+
     size_t in_pos = 0;
     while (in_pos < src_len) {
         size_t block_end = in_pos + ZXL_BLOCK_SIZE;
         if (block_end > src_len) block_end = src_len;
+
+        /* B5: find the earliest PE section boundary in (in_pos, block_end)
+         * that yields a block of at least ZXL_B5_MIN_BLOCK on both sides.
+         * Splits too close to in_pos or block_end are skipped (not useful)
+         * but don't disqualify later splits in the same range. */
+        while (next_split_idx < n_pe_splits && pe_splits[next_split_idx] <= in_pos)
+            next_split_idx++;
+        for (size_t _si = next_split_idx; _si < n_pe_splits; _si++) {
+            size_t sp = pe_splits[_si];
+            if (sp >= block_end) break;
+            if ((sp - in_pos) >= ZXL_B5_MIN_BLOCK
+                && (block_end - sp) >= ZXL_B5_MIN_BLOCK) {
+                block_end = sp;
+                break;
+            }
+        }
 
         size_t room = (size_t)(end - p);
         if (room < 16) { free(ctx); free(bcj_buf); return -1; }
