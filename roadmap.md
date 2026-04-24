@@ -5,17 +5,18 @@ Replaces the old PHASES.md (folded in here).
 
 ---
 
-## Current state (2026-04-24, post B5)
+## Current state (2026-04-25, post D1.5 rank-1 factored freqs)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------|--------|--------|---------|---------|--------|
-| ntdll.dll    | 0.4110 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
-| kernel32.dll | 0.4252 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
-| user32.dll   | 0.3427 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
+| ntdll.dll    | 0.4098 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
+| kernel32.dll | 0.4236 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
+| user32.dll   | 0.3419 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
 
 - Beats gzip-9, zstd-9, bzip2-9 on all three files.
-- Gap to zstd-19: **+0.97 / +2.28 / +1.15 pts** — ntdll is within 1 pt of zstd-19.
-- Gap to xz-9e: +3.38 / +4.67 / +3.62 pts.
+- Gap to zstd-19: **+0.85 / +2.12 / +1.07 pts.**
+- Gap to xz-9e: +3.26 / +4.51 / +3.54 pts.
+- **Small-file ratio jumped sharply** (test.js −3.3 pts, test.pdf/png now compress). D1.5 dissolved the per-block header overhead that was crushing sub-500 KB inputs.
 
 ---
 
@@ -34,6 +35,7 @@ Format tricks:
 - LRU-5 REP offsets, variable-length offset classes (EXACT1/2/3, DELTA1/2/3), TOK_EXACT0 for 3-byte local matches.
 - x86 BCJ filter, x64 RIP-relative BCJ filter, C2 IAT delta filter.
 - D1 compact freq tables (bitmap + varint) — cuts per-block header ~10 KB → ~3 KB.
+- **D1.5 rank-1 factored freq tables** — per-table encoder choice: ship 16 row + 16 col marginals as varints and reconstruct the 256-bin table via outer product, when that's cheaper than a full dense compact table. Analytical cost comparison picks dense vs rank-1 per table. Cut header further; won 1–3 pts on small non-PE files.
 - B5 PE-section-aware block boundaries — parses PE section table and forces block splits at section starts (guarded by 512 KB min-block). Each block's freq tables specialize to one section's statistics.
 
 ---
@@ -52,16 +54,12 @@ Don't forget these or we'll waste sessions re-learning them:
 
 ## Roadmap — next sessions
 
-### Session N+1 — Low-rank factored freq tables (the novel math bet)
-**Branch:** `feat/lowrank-freqs` · **Expected:** −0.3 to −0.8 pts, and structurally unblocks D2.
+### Session N+1 — N_LIT_CTX expansion under the new overhead floor
+**Branch:** `feat/lit-ctx-32-or-64` · **Expected:** −0.2 to −0.5 pts.
 
-A 256-bin frequency table usually isn't a free distribution — it factors close to a product of a 16-bin high-nibble distribution and a 16-bin low-nibble distribution. Parameterize as an outer product (32 values → reconstruct 256) or as a rank-k tensor for higher-context tables.
+D1.5 changed the arithmetic: each rank-1 literal table is ~40 B (vs dense ~150 B). Previously, N_LIT_CTX=32 regressed kernel32 by +0.33 pts due to 16 × ~150 B = 2.4 KB extra header. With rank-1 typical headers, 16 extra tables cost ~640 B on kernel32 (836 KB) = 0.08% header penalty — well under any modeling gain we'd expect from finer literal contexts.
 
-Per block: fit a low-rank approximation to the observed freq table via SVD on the 16×16 pivot, ship the rank-k factors instead of the full table. Worst case fall back to dense.
-
-**Why this is the right bet:** It directly dissolves the per-block overhead ceiling that's blocking everything (D2, length split, more contexts). At rank 1, a freq table costs ~32 B instead of ~150 B — and at rank 2 still ~64 B. This lets us add the sub-models that failed their overhead math.
-
-I haven't seen this in any production codec. Closest analogue is tensor-factorized neural network weights; applying it to rANS freq tables is novel.
+Plan: bump N_LIT_CTX to 32 (maybe 64), re-benchmark, accept if kernel32 doesn't regress. This is the D2 slot from the old PHASES.md, unblocked by D1.5.
 
 ---
 
@@ -115,7 +113,7 @@ Mutually exclusive with low-rank in most respects — pick whichever proves on t
 
 ## Deprioritized (don't retry without structural change first)
 
-- **N_LIT_CTX ≠ 16** — kernel32 overhead ceiling blocks it until low-rank or adaptive rANS lands.
+- ~~**N_LIT_CTX ≠ 16** — kernel32 overhead ceiling blocks it until low-rank or adaptive rANS lands.~~ **UNBLOCKED by D1.5.** Promoted to Session N+1.
 - **More per-block rANS stream splits** (length / opcode subdivisions) — same overhead math, same failure mode.
 - **Deeper hash chains or larger hash tables** — BT already proved chains aren't the bottleneck at depth 256+.
 - **Order-2 literal context via byte-pair hashes** — destroys x86 opcode-class clustering; has to be redesigned around the clustering, not against it.

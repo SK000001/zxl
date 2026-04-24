@@ -4,13 +4,13 @@ A lossless binary compression codec tuned for x86/x64 PE executables. Written in
 
 Beats gzip-9, zstd-9, and bzip2-9 on every PE benchmark file. Within 1 pt of zstd-19 on ntdll.dll.
 
-## Current benchmarks (post B5, 2026-04-24)
+## Current benchmarks (post D1.5, 2026-04-25)
 
 | File         | Size    | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------:|-------:|-------:|-------:|--------:|--------:|-------:|
-| ntdll.dll    | 2.52 MB | **0.4110** | 0.4596 | 0.4442 | 0.4346 | 0.4013 | 0.3772 |
-| kernel32.dll | 836 KB  | **0.4252** | 0.4574 | 0.4455 | 0.4416 | 0.4024 | 0.3785 |
-| user32.dll   | 1.87 MB | **0.3427** | 0.3852 | 0.3630 | 0.3651 | 0.3312 | 0.3065 |
+| ntdll.dll    | 2.52 MB | **0.4098** | 0.4596 | 0.4442 | 0.4346 | 0.4013 | 0.3772 |
+| kernel32.dll | 836 KB  | **0.4236** | 0.4574 | 0.4455 | 0.4416 | 0.4024 | 0.3785 |
+| user32.dll   | 1.87 MB | **0.3419** | 0.3852 | 0.3630 | 0.3651 | 0.3312 | 0.3065 |
 
 Ratios shown as compressed / original (lower is better).
 
@@ -67,6 +67,7 @@ Requires a C11 compiler with AVX2/SSE2 (`-march=native`) and `-lm`.
 - Range-ANS (rANS, Fabian Giesen's "Simple rANS"). Freq tables normalised to sum 16384 (scale bits = 14).
 - **22 independent rANS streams per block**: 2 opcode contexts (after-match / after-literal), off_lo, off_hi, delta, length, and 16 context-coded literal sub-streams (context = `prev_out >> 4`).
 - **D1 compact freq tables**: 32-byte bitmap of nonzero entries + varint-encoded freqs (1 byte for f<128, 2 bytes for f<16384). Cuts per-block header from ~10.5 KB raw to ~3 KB.
+- **D1.5 rank-1 factored freq tables**: per-table encoder choice. When a 256-bin distribution factors well in (high-nibble, low-nibble) coordinates, ship 16 row + 16 col marginals (~40 B) and reconstruct via outer product, instead of dense compact (~150 B). Encoder compares header + analytical coding cost under each model, picks smaller. Preceded by a one-byte mode flag. Cut small-file ratios by 1–3 pts.
 
 ### Pre-filters (applied to MZ-magic inputs only)
 - **x64 RIP-relative BCJ**: `MOV/LEA/CMP [rip+disp32]` + SSE/CMOV variants → absolute addresses.
@@ -108,7 +109,7 @@ Per block:
 
 See `roadmap.md` for the full forward plan, shipped work, and experimental constraints learned so far.
 
-**Next up:** low-rank factored frequency tables (rank-1 / rank-2 parameterization of 256-bin distributions as outer products of two 16-bin distributions) to break the per-block-header-overhead ceiling that currently blocks higher-order literal contexts.
+**Next up:** N_LIT_CTX expansion (16 → 32 or 64), newly viable now that D1.5 slashed per-block header overhead.
 
 ## License
 
