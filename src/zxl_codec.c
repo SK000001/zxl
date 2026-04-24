@@ -161,6 +161,197 @@ static size_t read_compact_freqs(const uint8_t *src, size_t avail, uint32_t cnt[
 }
 
 /* ------------------------------------------------------------------ */
+/* D1.5: Rank-1 factored freq-table codec                             */
+/* ------------------------------------------------------------------ */
+/*
+ * Observation: a 256-bin byte-frequency distribution is often close to
+ * separable in high-nibble × low-nibble coordinates. If freq[hi*16 + lo]
+ * factors approximately as R[hi] * C[lo] / S, we only need to ship the
+ * 16 row-marginals and 16 column-marginals (~32 bytes as varints)
+ * instead of the full table (~100-250 bytes under D1-dense).
+ *
+ * This is a per-table choice. The encoder computes both the dense bit
+ * cost and the rank-1 bit cost analytically from actual symbol counts,
+ * plus the header sizes of each, and picks the smaller. A leading mode
+ * byte per table (0 = dense, 1 = rank-1) tells the decoder which path
+ * to follow.
+ *
+ * When rank-1 wins, the encoder's rANS model is built from the
+ * *reconstructed* frequencies — not the original — so that what the
+ * encoder used to compress matches what the decoder will reconstruct.
+ * rank1_reconstruct() is deterministic and shared, so both sides agree.
+ *
+ * Worst case rank-1 header: 1 (mode) + 32 * 2 = 65 bytes.
+ * Typical rank-1 header: 1 + 40 = 41 bytes.
+ * Dense header ranges 1 + 100 to 1 + 250 bytes depending on sparsity.
+ */
+#define ZXL_FREQ_MODE_DENSE  0
+#define ZXL_FREQ_MODE_RANK1  1
+#define ZXL_RANK1_HDR_MAX    (1u + 32u * 2u)   /* mode byte + 32 varints worst case */
+
+static inline size_t varint_write_u16(uint8_t *dst, uint32_t v)
+{
+    if (v < 128u) { dst[0] = (uint8_t)v; return 1; }
+    dst[0] = (uint8_t)(0x80u | (v >> 8));
+    dst[1] = (uint8_t)(v & 0xFFu);
+    return 2;
+}
+
+static inline int varint_read_u16(const uint8_t **pp, const uint8_t *end, uint32_t *out)
+{
+    if (*pp >= end) return 0;
+    uint8_t b = *(*pp)++;
+    if ((b & 0x80u) == 0) { *out = b; return 1; }
+    if (*pp >= end) return 0;
+    *out = ((uint32_t)(b & 0x7Fu) << 8) | (uint32_t)(*(*pp)++);
+    return 1;
+}
+
+/* Reconstruct 256-bin counts from row and col marginals under the
+ * rank-1 outer-product assumption freq[hi*16+lo] = R[hi] * C[lo] / S
+ * where S = sum(R) = sum(C). Renormalizes the result to exactly
+ * RANS_SCALE via largest-remainder so rans_build_tables receives a
+ * valid distribution. Deterministic: the encoder must call this with
+ * the same row/col it will ship in the header, and the decoder calls
+ * it with the values just parsed from the stream. */
+static void rank1_reconstruct(const uint32_t row[16], const uint32_t col[16],
+                               uint32_t cnt[256])
+{
+    uint32_t s = 0;
+    for (int i = 0; i < 16; i++) s += row[i];
+    if (s == 0) { for (int i = 0; i < 256; i++) cnt[i] = 0; return; }
+
+    int64_t remainder[256];
+    int64_t total = 0;
+    for (int hi = 0; hi < 16; hi++) {
+        for (int lo = 0; lo < 16; lo++) {
+            int64_t prod = (int64_t)row[hi] * (int64_t)col[lo];
+            uint32_t q = (uint32_t)(prod / s);
+            cnt[hi * 16 + lo] = q;
+            remainder[hi * 16 + lo] = prod - (int64_t)q * (int64_t)s;
+            total += q;
+        }
+    }
+
+    int32_t diff = (int32_t)RANS_SCALE - (int32_t)total;
+    while (diff > 0) {
+        int best = 0;
+        int64_t best_r = remainder[0];
+        for (int i = 1; i < 256; i++) if (remainder[i] > best_r) { best_r = remainder[i]; best = i; }
+        cnt[best]++;
+        remainder[best] = -1;
+        diff--;
+    }
+    while (diff < 0) {
+        int best = -1;
+        int64_t best_r = (int64_t)1 << 62;
+        for (int i = 0; i < 256; i++) {
+            if (cnt[i] > 0 && remainder[i] < best_r) { best_r = remainder[i]; best = i; }
+        }
+        if (best < 0) break;
+        cnt[best]--;
+        remainder[best] = (int64_t)1 << 62;
+        diff++;
+    }
+}
+
+/* Given raw (possibly un-normalized) stream counts, decide whether the
+ * dense or rank-1 format encodes fewer total bytes (header + bit cost),
+ * run rans_build_tables with whichever counts will actually be encoded,
+ * and populate row/col for the header writer. Returns the mode byte. */
+static int build_freqs_auto(const uint32_t cnt[256],
+                             RansSym syms[256], RansSlot slots[RANS_SCALE],
+                             uint32_t row[16], uint32_t col[16])
+{
+    /* First build dense tables so we have normalized freqs (summing to
+     * RANS_SCALE) to compute marginals against. */
+    rans_build_tables(cnt, syms, slots);
+
+    /* Row / col marginals from the normalized dense freqs. */
+    for (int i = 0; i < 16; i++) { row[i] = 0; col[i] = 0; }
+    for (int i = 0; i < 256; i++) {
+        row[i >> 4] += syms[i].freq;
+        col[i & 15] += syms[i].freq;
+    }
+
+    /* Reconstruct rank-1 counts. */
+    uint32_t rcnt[256];
+    rank1_reconstruct(row, col, rcnt);
+
+    /* Analytical bit cost for each model using actual counts in the stream.
+     * (The cost is the sum of -log2(p) weighted by count; the log2(RANS_SCALE)
+     * constant cancels in the comparison but we include it for clarity.) */
+    double dense_bits = 0.0, rank1_bits = 0.0;
+    double scale_log = 14.0;  /* log2(RANS_SCALE) == log2(16384) */
+    for (int i = 0; i < 256; i++) {
+        if (cnt[i] == 0) continue;
+        double d = (syms[i].freq > 0) ? (scale_log - log2((double)syms[i].freq))
+                                       : 30.0;
+        double r = (rcnt[i]       > 0) ? (scale_log - log2((double)rcnt[i]))
+                                       : 30.0;
+        dense_bits += (double)cnt[i] * d;
+        rank1_bits += (double)cnt[i] * r;
+    }
+
+    /* Header sizes (excluding leading mode byte, which both pay equally). */
+    size_t dense_hdr = 32;
+    for (int i = 0; i < 256; i++) if (syms[i].freq > 0)
+        dense_hdr += (syms[i].freq < 128u) ? 1u : 2u;
+    size_t rank1_hdr = 0;
+    for (int i = 0; i < 16; i++) rank1_hdr += (row[i] < 128u) ? 1u : 2u;
+    for (int i = 0; i < 16; i++) rank1_hdr += (col[i] < 128u) ? 1u : 2u;
+
+    double dense_total = dense_bits / 8.0 + (double)dense_hdr;
+    double rank1_total = rank1_bits / 8.0 + (double)rank1_hdr;
+
+    if (rank1_total + 1.0 < dense_total) {
+        /* Rebuild tables using reconstructed counts — what the decoder will
+         * also use after reading row/col from the header. */
+        rans_build_tables(rcnt, syms, slots);
+        return ZXL_FREQ_MODE_RANK1;
+    }
+    return ZXL_FREQ_MODE_DENSE;
+}
+
+/* Write one freq table in the chosen mode. Emits [mode byte][payload]. */
+static size_t write_freqs_tagged(uint8_t *dst, int mode,
+                                  const RansSym syms[256],
+                                  const uint32_t row[16], const uint32_t col[16])
+{
+    uint8_t *p = dst;
+    *p++ = (uint8_t)mode;
+    if (mode == ZXL_FREQ_MODE_RANK1) {
+        for (int i = 0; i < 16; i++) p += varint_write_u16(p, row[i]);
+        for (int i = 0; i < 16; i++) p += varint_write_u16(p, col[i]);
+    } else {
+        p += write_compact_freqs(p, syms);
+    }
+    return (size_t)(p - dst);
+}
+
+/* Decode one freq table. Reads [mode byte][payload], fills cnt[]. */
+static size_t read_freqs_tagged(const uint8_t *src, size_t avail, uint32_t cnt[256])
+{
+    if (avail < 1) return 0;
+    const uint8_t *p = src;
+    const uint8_t *end = src + avail;
+    uint8_t mode = *p++;
+    if (mode == ZXL_FREQ_MODE_RANK1) {
+        uint32_t row[16], col[16];
+        for (int i = 0; i < 16; i++) if (!varint_read_u16(&p, end, &row[i])) return 0;
+        for (int i = 0; i < 16; i++) if (!varint_read_u16(&p, end, &col[i])) return 0;
+        rank1_reconstruct(row, col, cnt);
+        return (size_t)(p - src);
+    }
+    if (mode == ZXL_FREQ_MODE_DENSE) {
+        size_t consumed = read_compact_freqs(p, (size_t)(end - p), cnt);
+        if (consumed == 0) return 0;
+        return 1u + consumed;
+    }
+    return 0;  /* unknown mode */
+}
+
+/* ------------------------------------------------------------------ */
 /* x64 RIP-relative BCJ filter                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1263,38 +1454,41 @@ static size_t compress_block(MatchCtx *ctx,
         }
     }
 
-    /* Build rANS tables for both opcode sub-streams */
+    /* Build rANS tables + per-table rank-1/dense mode. */
+    int      am_mode, al_mode, off_lo_mode, off_hi_mode, delta_mode, len_mode;
+    uint32_t am_row[16], am_col[16], al_row[16], al_col[16];
+    uint32_t off_lo_row[16], off_lo_col[16], off_hi_row[16], off_hi_col[16];
+    uint32_t delta_row[16], delta_col[16], len_row[16], len_col[16];
+
     uint32_t am_counts[256] = {0};
     for (size_t i = 0; i < am_len; i++) am_counts[opcode_am[i]]++;
     RansSym  am_syms[256];  RansSlot am_slots[RANS_SCALE];
-    rans_build_tables(am_counts, am_syms, am_slots);
+    am_mode = build_freqs_auto(am_counts, am_syms, am_slots, am_row, am_col);
 
     uint32_t al_counts[256] = {0};
     for (size_t i = 0; i < al_len; i++) al_counts[opcode_al[i]]++;
     RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
-    rans_build_tables(al_counts, al_syms, al_slots);
+    al_mode = build_freqs_auto(al_counts, al_syms, al_slots, al_row, al_col);
 
     uint32_t off_lo_counts[256] = {0};
     for (size_t i = 0; i < off_lo_len; i++) off_lo_counts[off_lo_buf[i]]++;
     RansSym  off_lo_syms[256]; RansSlot off_lo_slots[RANS_SCALE];
-    rans_build_tables(off_lo_counts, off_lo_syms, off_lo_slots);
+    off_lo_mode = build_freqs_auto(off_lo_counts, off_lo_syms, off_lo_slots, off_lo_row, off_lo_col);
 
     uint32_t off_hi_counts[256] = {0};
     for (size_t i = 0; i < off_hi_len; i++) off_hi_counts[off_hi_buf[i]]++;
     RansSym  off_hi_syms[256]; RansSlot off_hi_slots[RANS_SCALE];
-    rans_build_tables(off_hi_counts, off_hi_syms, off_hi_slots);
+    off_hi_mode = build_freqs_auto(off_hi_counts, off_hi_syms, off_hi_slots, off_hi_row, off_hi_col);
 
     uint32_t delta_counts[256] = {0};
     for (size_t i = 0; i < delta_len; i++) delta_counts[delta_buf[i]]++;
-    RansSym  delta_syms[256];
-    RansSlot delta_slots[RANS_SCALE];
-    rans_build_tables(delta_counts, delta_syms, delta_slots);
+    RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
+    delta_mode = build_freqs_auto(delta_counts, delta_syms, delta_slots, delta_row, delta_col);
 
     uint32_t len_counts[256] = {0};
     for (size_t i = 0; i < lbuf_size; i++) len_counts[lbuf[i]]++;
-    RansSym  len_syms[256];
-    RansSlot len_slots[RANS_SCALE];
-    rans_build_tables(len_counts, len_syms, len_slots);
+    RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
+    len_mode = build_freqs_auto(len_counts, len_syms, len_slots, len_row, len_col);
 
     /* ---- Entropy-code literal stream: N_LIT_CTX context models ----
      * Split lit_buf into N_LIT_CTX sub-streams by (prev_byte >> N_LIT_CTX_SHIFT).
@@ -1328,6 +1522,9 @@ static size_t compress_block(MatchCtx *ctx,
         free(lit_syms_ctx); free(lit_enc);
         free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
     }
+    int       lit_mode[N_LIT_CTX];
+    uint32_t  lit_row [N_LIT_CTX][16];
+    uint32_t  lit_col [N_LIT_CTX][16];
     {
         RansSlot *tmp_slots = (RansSlot *)malloc(RANS_SCALE * sizeof(RansSlot));
         if (!tmp_slots) { free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
@@ -1335,7 +1532,8 @@ static size_t compress_block(MatchCtx *ctx,
             uint32_t cnt[256] = {0};
             for (size_t j = 0; j < lit_sub_len[c]; j++)
                 cnt[lit_sub[lit_sub_off[c] + j]]++;
-            rans_build_tables(cnt, lit_syms_ctx[c], tmp_slots);
+            lit_mode[c] = build_freqs_auto(cnt, lit_syms_ctx[c], tmp_slots,
+                                            lit_row[c], lit_col[c]);
             if (lit_sub_len[c] > 0) {
                 size_t enc = rans_encode(lit_sub + lit_sub_off[c], lit_sub_len[c],
                                          lit_syms_ctx[c], scratch, scratch_cap);
@@ -1432,8 +1630,9 @@ static size_t compress_block(MatchCtx *ctx,
      *   enc_am == 0 → raw fallback (literal copy at offset 60)
      */
     #define N_HDR_FIELDS 15
-    /* Worst-case compact freq tables (D1): ZXL_COMPACT_FREQ_MAX per table. */
-    size_t hdr_size = 4*N_HDR_FIELDS + ZXL_COMPACT_FREQ_MAX*(6 + N_LIT_CTX) + N_LIT_CTX*4*2;
+    /* Worst-case freq tables: 1 mode byte + ZXL_COMPACT_FREQ_MAX dense payload per table.
+     * 6 main tables (am, al, off_lo, off_hi, delta, len) + N_LIT_CTX literal tables. */
+    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*(6 + N_LIT_CTX) + N_LIT_CTX*4*2;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
     size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
@@ -1476,14 +1675,14 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
     /* D1: compact (bitmap + varint) freq tables. */
-    p += write_compact_freqs(p, am_syms);
-    p += write_compact_freqs(p, al_syms);
-    p += write_compact_freqs(p, off_lo_syms);
-    p += write_compact_freqs(p, off_hi_syms);
-    p += write_compact_freqs(p, delta_syms);
-    p += write_compact_freqs(p, len_syms);
+    p += write_freqs_tagged(p, am_mode,     am_syms,     am_row,     am_col);
+    p += write_freqs_tagged(p, al_mode,     al_syms,     al_row,     al_col);
+    p += write_freqs_tagged(p, off_lo_mode, off_lo_syms, off_lo_row, off_lo_col);
+    p += write_freqs_tagged(p, off_hi_mode, off_hi_syms, off_hi_row, off_hi_col);
+    p += write_freqs_tagged(p, delta_mode,  delta_syms,  delta_row,  delta_col);
+    p += write_freqs_tagged(p, len_mode,    len_syms,    len_row,    len_col);
     for (int c = 0; c < N_LIT_CTX; c++)
-        p += write_compact_freqs(p, lit_syms_ctx[c]);
+        p += write_freqs_tagged(p, lit_mode[c], lit_syms_ctx[c], lit_row[c], lit_col[c]);
     for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_enc_sz[c]);  p += 4; }
     for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_sub_len[c]); p += 4; }
 
@@ -1570,7 +1769,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     #define READ_COMPACT_FREQS_INTO(syms_arr, slots_arr)                         \
         do {                                                                       \
             uint32_t _cnt[256];                                                    \
-            size_t _consumed = read_compact_freqs(tp, (size_t)(tp_end - tp), _cnt); \
+            size_t _consumed = read_freqs_tagged(tp, (size_t)(tp_end - tp), _cnt); \
             if (_consumed == 0) return 0;                                          \
             tp += _consumed;                                                       \
             rans_build_tables(_cnt, (syms_arr), (slots_arr));                      \
@@ -1599,7 +1798,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     if (!lit_slots_all) return 0;
     for (int c = 0; c < N_LIT_CTX; c++) {
         RansSym  syms[256];  uint32_t cnt[256];
-        size_t consumed = read_compact_freqs(tp, (size_t)(tp_end - tp), cnt);
+        size_t consumed = read_freqs_tagged(tp, (size_t)(tp_end - tp), cnt);
         if (consumed == 0) { free(lit_slots_all); return 0; }
         tp += consumed;
         rans_build_tables(cnt, syms, lit_slots_all + c * RANS_SCALE);
