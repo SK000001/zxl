@@ -1,8 +1,8 @@
-*.o
 *.exe
+*.o
 *.zxl
 .claude/
-todo.txt
-tests/
-logs/
 .env
+logs/
+tests/
+workflow.md
