@@ -54,16 +54,19 @@ Don't forget these or we'll waste sessions re-learning them:
 
 ## Roadmap — next sessions
 
-### Session N+1 — N_LIT_CTX expansion under the new overhead floor
-**Branch:** `feat/lit-ctx-32-or-64` · **Expected:** −0.2 to −0.5 pts.
+### ~~Session N+1 — N_LIT_CTX expansion under the new overhead floor~~ FAILED 2026-04-25
+Tested with D1.5 rank-1 freq tables in place. Results vs N_LIT_CTX=16 baseline:
 
-D1.5 changed the arithmetic: each rank-1 literal table is ~40 B (vs dense ~150 B). Previously, N_LIT_CTX=32 regressed kernel32 by +0.33 pts due to 16 × ~150 B = 2.4 KB extra header. With rank-1 typical headers, 16 extra tables cost ~640 B on kernel32 (836 KB) = 0.08% header penalty — well under any modeling gain we'd expect from finer literal contexts.
+  N_LIT_CTX=32: ntdll −0.06, kernel32 +0.07, user32 +0.10, test.js +1.29,
+                test.json +0.68, test.pdf +0.78, test.png +0.60. Mixed.
+  N_LIT_CTX=64: strict regression on every file (kernel32 +0.26,
+                user32 +0.30, test.js +3.39, etc).
 
-Plan: bump N_LIT_CTX to 32 (maybe 64), re-benchmark, accept if kernel32 doesn't regress. This is the D2 slot from the old PHASES.md, unblocked by D1.5.
+**Lesson:** D1.5 only addressed per-table header overhead. The 16-context limit was also constrained by sub-stream sample dilution — splitting literals across 32 buckets means each rANS sub-stream has half as many samples, which hurts the freq-table normalization quality even when the table itself ships compactly. Dilution effect dominates header savings beyond N_LIT_CTX=16 for the file sizes we benchmark. Branch abandoned; N_LIT_CTX stays 16. Added to "Tried and reverted" below.
 
 ---
 
-### Session N+2 — Semantic typed streams
+### Session N+1 — Semantic typed streams
 **Branch:** `feat/typed-streams` · **Expected:** −0.5 to −1.0 pts on PE.
 
 Partition each block's bytes into semantic streams before LZ/rANS:
@@ -81,7 +84,7 @@ Requires a minimal x86 decoder (opcode → length). Multi-week but structurally 
 
 ---
 
-### Session N+3 — Cross-DLL shared dictionary
+### Session N+2 — Cross-DLL shared dictionary
 **Branch:** `feat/crossdll-dict` · **Expected:** −1.0 to −2.0 pts when compressing multiple DLLs together.
 
 ntdll / kernel32 / user32 share boilerplate: SEH prologues, import stubs, standard epilogue patterns. kernel32 forwards many exports to ntdll. When compressed together, a shared prefix dictionary (concat or learned) gives each file a warm match window instead of starting cold.
@@ -92,7 +95,7 @@ Closest public analogue is zstd's `--train` dictionaries — but those are gener
 
 ---
 
-### Session N+4+ — Semi-adaptive rANS as a fallback path
+### Session N+3+ — Semi-adaptive rANS as a fallback path
 **Branch:** `feat/semi-adaptive-rans` · **Expected:** −0.3 to −0.8 pts.
 
 If low-rank freq tables don't pan out, fall back to semi-adaptive: transmit freq tables once per block as today, then mid-block emit small freq deltas every ~256 KB to track distribution drift. Captures section-boundary drift without a full rewrite to per-symbol adaptation.
@@ -113,7 +116,7 @@ Mutually exclusive with low-rank in most respects — pick whichever proves on t
 
 ## Deprioritized (don't retry without structural change first)
 
-- ~~**N_LIT_CTX ≠ 16** — kernel32 overhead ceiling blocks it until low-rank or adaptive rANS lands.~~ **UNBLOCKED by D1.5.** Promoted to Session N+1.
+- **N_LIT_CTX ≠ 16** — overhead ceiling lifted by D1.5, but expansion still net-regresses (sub-stream sample dilution). Don't retry without changing the literal-stream segmentation strategy itself.
 - **More per-block rANS stream splits** (length / opcode subdivisions) — same overhead math, same failure mode.
 - **Deeper hash chains or larger hash tables** — BT already proved chains aren't the bottleneck at depth 256+.
 - **Order-2 literal context via byte-pair hashes** — destroys x86 opcode-class clustering; has to be redesigned around the clustering, not against it.

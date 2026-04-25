@@ -109,7 +109,7 @@ Per block:
 
 See `roadmap.md` for the full forward plan, shipped work, and experimental constraints learned so far.
 
-**Next up:** N_LIT_CTX expansion (16 → 32 or 64), newly viable now that D1.5 slashed per-block header overhead.
+**Next up:** semantic typed streams — partition each block by byte type (opcode / mod-rm / immediate / pointer / string) before LZ + rANS.
 
 ## License
 
