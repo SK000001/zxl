@@ -52,6 +52,21 @@ Don't forget these or we'll waste sessions re-learning them:
 
 ---
 
+## Phase-0 instrumentation findings (2026-04-27)
+
+All three roadmap items below were instrumented (not implemented) in
+back-to-back sessions to validate their gain estimates against reality.
+Results were significantly below the original estimates — all three
+are now considered marginal-to-negative on the existing architecture.
+
+| Item | Roadmap est. | Measured headroom |
+|---|---|---|
+| Typed streams (x86 split) | −0.5 to −1.0 | ~0.5 bit 0-order gap, mostly captured by existing LZ + 16-context literals; opcode/operand entropy near-identical (6.44 vs 6.39 on ntdll). Realistic ~−0.1 to −0.4. |
+| Cross-DLL dictionary | −1.0 to −2.0 | Concat-test: ntdll+kernel32 saves 12.3 KB (0.37 pts), ntdll+user32 saves 0 (user32 doesn't share much with ntdll directly). 2 MB window puts ntdll out of reach for late-position user32 anyway. All-3 concat saves 14.7 KB (0.28 pts). |
+| Semi-adaptive rANS | −0.3 to −0.8 | 2-way split entropy probe: ntdll 0.09 pts, kernel32 0.16 pts, user32 0.08 pts after ~50 B/stream/delta header cost. Small text files (test.js / test.json) net-regress unless gated. |
+
+**Why the codec is near local optimum.** B5 already specialises freq tables to PE sections (kills typed-streams' easy bin), 16-context literal model already captures most byte-pair structure (kills semi-adaptive's drift signal), 2 MB window limits cross-DLL reach. Residual structural wins exist but require items from "Further out": instruction-level LZ (x86 decoder, multi-week), .reloc-driven pointer normalisation (multi-week, no public precedent), suffix-array optimal parsing (modest gain on top of BT), bit-level arithmetic coder (decoder-cost trade-off).
+
 ## Roadmap — next sessions
 
 ### ~~Session N+1 — N_LIT_CTX expansion under the new overhead floor~~ FAILED 2026-04-25
