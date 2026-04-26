@@ -69,6 +69,32 @@ are now considered marginal-to-negative on the existing architecture.
 
 ## Roadmap — next sessions
 
+### Session N+1 — BPE-style trained vocabulary (smallest "custom language" step)
+**Branch:** `feat/bpe-vocab` · **Expected:** −0.5 to −2.0 pts on PE if it works, abandon-at-phase-0 if it doesn't.
+
+Idea: classic byte-pair encoding builds a vocabulary of the most-frequent N-grams (length 2-32 bytes) by greedy pair merging over a training corpus. Each vocab entry gets a short token id (12 bits → 4096 entries). At compression time, scan input greedily/optimally for vocab matches; replace each match with a 2-byte token. Falls back to existing LZ + literals for unmatched regions.
+
+Why this might pay where cross-DLL didn't: a *trained* vocabulary captures patterns that are genuinely shared across all Windows DLLs (function prologues, SEH unwind, common stub shapes, IAT layouts) — not just patterns that happen to be byte-identical between two specific files in a 2 MB window.
+
+Phase-0 plan (do first, before any format change):
+1. Standalone BPE trainer over a corpus → produces vocab file (~4096 entries, average entry length 4-8 bytes).
+2. Standalone probe: scan ntdll/kernel32/user32, count bytes replaceable by vocab tokens, estimate net savings (replaced bytes − 2 B/token).
+3. Decision rule: if estimated savings ≥ 1.0 pts on at least one PE file (after subtracting vocab dictionary overhead, ~30-50 KB), proceed to codec integration. Else abandon.
+
+Codec integration if phase-0 passes (~250 LOC):
+- New token TOK_VOCAB + 12-bit index, fits in spare opcode slot 0xF4-FF range.
+- DP parser learns to compare vocab-match cost vs LZ-match cost vs literal.
+- Vocab dictionary either compiled-in (no header overhead, only helps Windows PE) or per-file shipped in header (works on arbitrary input, ~30 KB header cost).
+
+Risk modes worth naming:
+- Vocab entries overlap with LZ matches → no net win if LZ already finds them.
+- Training-set vs test-set leakage → use leave-one-out (train on 2 DLLs, test on 3rd).
+- 12-bit token cost (1.5 B encoded) may not beat LZ's existing exact-match encoding (1-3 B offset + 1-2 B length) for short patterns — vocab needs to win on the patterns that are awkward for LZ specifically.
+
+If this works, the next escalation steps are in "Further out" → pattern grammar then full instruction-level LZ.
+
+
+
 ### ~~Session N+1 — N_LIT_CTX expansion under the new overhead floor~~ FAILED 2026-04-25
 Tested with D1.5 rank-1 freq tables in place. Results vs N_LIT_CTX=16 baseline:
 
