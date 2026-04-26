@@ -69,29 +69,20 @@ are now considered marginal-to-negative on the existing architecture.
 
 ## Roadmap — next sessions
 
-### Session N+1 — BPE-style trained vocabulary (smallest "custom language" step)
-**Branch:** `feat/bpe-vocab` · **Expected:** −0.5 to −2.0 pts on PE if it works, abandon-at-phase-0 if it doesn't.
+### ~~Session N+1 — BPE-style trained vocabulary~~ FAILED 2026-04-27 at phase-0
 
-Idea: classic byte-pair encoding builds a vocabulary of the most-frequent N-grams (length 2-32 bytes) by greedy pair merging over a training corpus. Each vocab entry gets a short token id (12 bits → 4096 entries). At compression time, scan input greedily/optimally for vocab matches; replace each match with a 2-byte token. Falls back to existing LZ + literals for unmatched regions.
+Phase-0 probe (top-K-N-grams over kernel32+user32, tested on ntdll):
+- Naive coverage metric said 13 pts net savings (covered 736 KB / 29% of file with avg 4.3 B per match)
+- L=3 and L=4 matches alone account for 7.25 pts theoretical (the patterns LZ struggles with most)
 
-Why this might pay where cross-DLL didn't: a *trained* vocabulary captures patterns that are genuinely shared across all Windows DLLs (function prologues, SEH unwind, common stub shapes, IAT layouts) — not just patterns that happen to be byte-identical between two specific files in a 2 MB window.
+Empirical concat test (vocab dumped + prepended to ntdll, compressed with current zxl):
+- vocab + ntdll → 1,103,300 bytes vs ntdll standalone 1,033,531 bytes
+- Vocab-as-LZ-preload made things WORSE — preload added ~70 KB output, ntdll portion didn't shrink
+- Self-trained vocab (trained on ntdll itself, tested on ntdll) also worse: 1,103,042 bytes
 
-Phase-0 plan (do first, before any format change):
-1. Standalone BPE trainer over a corpus → produces vocab file (~4096 entries, average entry length 4-8 bytes).
-2. Standalone probe: scan ntdll/kernel32/user32, count bytes replaceable by vocab tokens, estimate net savings (replaced bytes − 2 B/token).
-3. Decision rule: if estimated savings ≥ 1.0 pts on at least one PE file (after subtracting vocab dictionary overhead, ~30-50 KB), proceed to codec integration. Else abandon.
+**Lesson:** the BPE-vocab approach is **structurally subsumed by LZ + rANS** for byte-level matching. The naive coverage probe was wildly optimistic because it assumed baseline cost is 1 B/byte literal, but real baseline is rANS-compressed LZ which already captures every repeated pattern. Vocab tokens at 2 B/match barely beat TOK_EXACT0/1 (which rANS-compress to ~2 B). Even with full TOK_VOCAB format integration the DP parser would pick LZ over vocab almost everywhere, because the underlying patterns are the same and LZ wins on within-file repetition.
 
-Codec integration if phase-0 passes (~250 LOC):
-- New token TOK_VOCAB + 12-bit index, fits in spare opcode slot 0xF4-FF range.
-- DP parser learns to compare vocab-match cost vs LZ-match cost vs literal.
-- Vocab dictionary either compiled-in (no header overhead, only helps Windows PE) or per-file shipped in header (works on arbitrary input, ~30 KB header cost).
-
-Risk modes worth naming:
-- Vocab entries overlap with LZ matches → no net win if LZ already finds them.
-- Training-set vs test-set leakage → use leave-one-out (train on 2 DLLs, test on 3rd).
-- 12-bit token cost (1.5 B encoded) may not beat LZ's existing exact-match encoding (1-3 B offset + 1-2 B length) for short patterns — vocab needs to win on the patterns that are awkward for LZ specifically.
-
-If this works, the next escalation steps are in "Further out" → pattern grammar then full instruction-level LZ.
+Don't retry without operating at a different REPRESENTATION than raw bytes — the byte-level competition is decisively won by LZ. Vocab approach can only win if applied to a stream where LZ doesn't naturally find matches (decoded x86 instructions, post-canonicalisation tokens, etc.) → which is exactly the "pattern grammar" / "instruction-level LZ" items in "Further out".
 
 
 
