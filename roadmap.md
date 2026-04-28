@@ -24,7 +24,7 @@ Replaces the old PHASES.md (folded in here).
 Core pipeline:
 - Three-way LZ: exact + XOR-delta + additive-delta matches.
 - 4-pass entropy-weighted DP optimal parser.
-- rANS entropy coding, 21 streams: 2 opcode contexts (after-match/after-literal) + off_lo + off_hi + delta + len + 16 literal sub-streams.
+- Adaptive binary range coder (LZMA-style, 11-bit prob precision, MOVE_BITS=5) for all 7 entropy streams: opcode_am, opcode_al, off_lo, off_hi, delta, len, lit. Literals condition on full prev-byte context (256 contexts × 8-bit tree); the other six streams are unconditional online-learned 256-bin models. No per-block freq tables.
 - 4 MB blocks, 2 MB window.
 
 Match finder:
@@ -38,7 +38,8 @@ Format tricks:
 - B5 PE-section-aware block boundaries — parses PE section table and forces block splits at section starts (guarded by 512 KB min-block). Each block's freq tables specialize to one section's statistics.
 - **Adaptive AC literals (2026-04-28)** — replaces the 16-context (prev_byte>>4 nibble) rANS literal sub-streams with a single LZMA-style adaptive binary range coder over 256 prev-byte contexts (8-bit tree per context, 11-bit prob precision, MOVE_BITS=5 update). Drops 16 per-block freq tables. Won −1.03 / −1.26 / −0.89 pts on PE; −0.15 to −1.74 on every small file. Phase-0 ceiling was 5.2 / 7.2 / 6.5 pts (order-1 byte cond. entropy); realised ~20% — small sub-streams' AC warm-up + byte-only context cap the immediate gain.
 - **Adaptive AC offsets (2026-04-28, Step B)** — same range coder applied to off_lo + off_hi. Initially tried 256 prev-byte contexts (mirroring literal model); regressed on most files. Walked context count down through 16/8/4/2/1; ratio improved monotonically. **Final: pure unconditional adaptive AC** — single 256-bin online-learned model per stream, no cross-symbol context. At 30K-140K samples per stream, byte-pair correlations are noise that AC's online learning can't separate from signal. The win comes from online drift adaptation + dropping 2 per-block freq tables (~300 B), biggest impact on kernel32's single-block layout. Won −0.28 / −0.42 / −0.24 pts on PE on top of Step A.
-- **Adaptive AC opcode/delta/lbuf — rANS fully retired (2026-04-28, Step C)** — same unconditional adaptive AC applied to opcode_am, opcode_al, delta, lbuf. Phase-0 said headroom was small (these streams were already near 0-order optimal under rANS), but Step B's tuning result generalised: dropped 4 more freq tables, online-drift adaptation still wins. Result: −0.39 / −0.48 / −0.34 pts on PE on top of Step B; ZXL now beats zstd-19 on all three PE files. Static rANS path is unused (helpers `__attribute__((unused))`-marked); full removal of zxl_rans.{c,h} is a follow-up.
+- **Adaptive AC opcode/delta/lbuf — rANS fully retired (2026-04-28, Step C)** — same unconditional adaptive AC applied to opcode_am, opcode_al, delta, lbuf. Phase-0 said headroom was small (these streams were already near 0-order optimal under rANS), but Step B's tuning result generalised: dropped 4 more freq tables, online-drift adaptation still wins. Result: −0.39 / −0.48 / −0.34 pts on PE on top of Step B; ZXL now beats zstd-19 on all three PE files.
+- **rANS infrastructure removed (2026-04-28, cleanup)** — deleted zxl_rans.{c,h} and the D1/D1.5 freq-table machinery (build_freqs_auto, write/read_freqs_tagged, rank1_reconstruct, write/read_compact_freqs, varint helpers, plus their constants). 498 LOC removed; ratios unchanged.
 
 ---
 
@@ -73,11 +74,6 @@ considered marginal-to-negative on the existing architecture.
 The remaining "Further out" items: instruction-level LZ (x86 decoder, multi-week — but typed-streams probe suggests opcode-level entropy is already mostly captured), suffix-array optimal parsing (modest gain on top of BT per roadmap's own assessment).
 
 ## Roadmap — next sessions
-
-### Cleanup — Remove dead rANS infrastructure
-**Branch:** `chore/remove-rans` · **Expected:** no ratio impact (pure cleanup).
-
-After Step C, zxl_rans.c/h is unreachable, plus `build_freqs_auto`, `write_freqs_tagged`, `read_freqs_tagged` and their helper chain (`rank1_reconstruct`, varint helpers, compact-freq helpers) in zxl_codec.c. Delete; trim Makefile. Reduces source by ~600 LOC.
 
 ### Step D — Context conditioning by opcode token type
 **Expected:** speculative.
