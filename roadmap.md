@@ -5,18 +5,17 @@ Replaces the old PHASES.md (folded in here).
 
 ---
 
-## Current state (2026-04-25, post D1.5 rank-1 factored freqs)
+## Current state (2026-04-28, post adaptive-AC literals)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------|--------|--------|---------|---------|--------|
-| ntdll.dll    | 0.4098 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
-| kernel32.dll | 0.4236 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
-| user32.dll   | 0.3419 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
+| ntdll.dll    | 0.3995 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
+| kernel32.dll | 0.4110 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
+| user32.dll   | 0.3330 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
 
-- Beats gzip-9, zstd-9, bzip2-9 on all three files.
-- Gap to zstd-19: **+0.85 / +2.12 / +1.07 pts.**
-- Gap to xz-9e: +3.26 / +4.51 / +3.54 pts.
-- **Small-file ratio jumped sharply** (test.js −3.3 pts, test.pdf/png now compress). D1.5 dissolved the per-block header overhead that was crushing sub-500 KB inputs.
+- Beats gzip-9, zstd-9, bzip2-9 on all three PE files. **Beats zstd-19 on ntdll** (0.3995 vs 0.4013); within +0.18 / +0.86 pts of zstd-19 on user32 / kernel32.
+- Gap to xz-9e: +2.23 / +3.25 / +2.65 pts (was +3.26 / +4.51 / +3.54 before AC literals).
+- Adaptive AC literals also won unanimously on small files: test.js −1.74, test.json −0.32, test.md −0.15, test.pdf −0.33, test.png −1.03 pts.
 
 ---
 
@@ -37,6 +36,7 @@ Format tricks:
 - D1 compact freq tables (bitmap + varint) — cuts per-block header ~10 KB → ~3 KB.
 - **D1.5 rank-1 factored freq tables** — per-table encoder choice: ship 16 row + 16 col marginals as varints and reconstruct the 256-bin table via outer product, when that's cheaper than a full dense compact table. Analytical cost comparison picks dense vs rank-1 per table. Cut header further; won 1–3 pts on small non-PE files.
 - B5 PE-section-aware block boundaries — parses PE section table and forces block splits at section starts (guarded by 512 KB min-block). Each block's freq tables specialize to one section's statistics.
+- **Adaptive AC literals (2026-04-28)** — replaces the 16-context (prev_byte>>4 nibble) rANS literal sub-streams with a single LZMA-style adaptive binary range coder over 256 prev-byte contexts (8-bit tree per context, 11-bit prob precision, MOVE_BITS=5 update). Drops 16 per-block freq tables. Won −1.03 / −1.26 / −0.89 pts on PE; −0.15 to −1.74 on every small file. Phase-0 ceiling was 5.2 / 7.2 / 6.5 pts (order-1 byte cond. entropy); realised ~20% — small sub-streams' AC warm-up + byte-only context cap the immediate gain. Architecture now in place for AC offset-stream extension (Step B).
 
 ---
 
@@ -54,20 +54,35 @@ Don't forget these or we'll waste sessions re-learning them:
 
 ## Phase-0 instrumentation findings (2026-04-27)
 
-All three roadmap items below were instrumented (not implemented) in
+All four roadmap items below were instrumented (not implemented) in
 back-to-back sessions to validate their gain estimates against reality.
-Results were significantly below the original estimates — all three
-are now considered marginal-to-negative on the existing architecture.
+Results were significantly below the original estimates — all are now
+considered marginal-to-negative on the existing architecture.
 
 | Item | Roadmap est. | Measured headroom |
 |---|---|---|
 | Typed streams (x86 split) | −0.5 to −1.0 | ~0.5 bit 0-order gap, mostly captured by existing LZ + 16-context literals; opcode/operand entropy near-identical (6.44 vs 6.39 on ntdll). Realistic ~−0.1 to −0.4. |
 | Cross-DLL dictionary | −1.0 to −2.0 | Concat-test: ntdll+kernel32 saves 12.3 KB (0.37 pts), ntdll+user32 saves 0 (user32 doesn't share much with ntdll directly). 2 MB window puts ntdll out of reach for late-position user32 anyway. All-3 concat saves 14.7 KB (0.28 pts). |
 | Semi-adaptive rANS | −0.3 to −0.8 | 2-way split entropy probe: ntdll 0.09 pts, kernel32 0.16 pts, user32 0.08 pts after ~50 B/stream/delta header cost. Small text files (test.js / test.json) net-regress unless gated. |
+| .reloc-driven pointer normalisation | −1.0 to −3.0 | x64 base relocations cover only 0.26–0.66% of file (827/685/617 absolute fields on ntdll/kernel32/user32). Most pointer-shaped data is IAT (caught by C2), RVAs, or RIP-relative (BCJ). Image-base subtraction yields 0-order entropy drop of ~0.8 bits on those few KB → **0.027 / 0.067 / 0.027 pts theoretical**, before paying for parser + transform + per-image-base header. Net-negative. |
 
-**Why the codec is near local optimum.** B5 already specialises freq tables to PE sections (kills typed-streams' easy bin), 16-context literal model already captures most byte-pair structure (kills semi-adaptive's drift signal), 2 MB window limits cross-DLL reach. Residual structural wins exist but require items from "Further out": instruction-level LZ (x86 decoder, multi-week), .reloc-driven pointer normalisation (multi-week, no public precedent), suffix-array optimal parsing (modest gain on top of BT), bit-level arithmetic coder (decoder-cost trade-off).
+**Phase-0 found one strong signal.** Probing order-1 byte conditional entropy on the live rANS streams (2026-04-28) revealed 5.2 / 7.2 / 6.5 pts of theoretical headroom on PE — larger than the gap to xz-9e. Most of it lives in the 16 literal sub-streams and the offset streams. **Step A shipped: adaptive-AC literals — see "What's shipped" above.** Step B (extend AC to off_lo/off_hi) and beyond remain.
+
+The remaining "Further out" items: instruction-level LZ (x86 decoder, multi-week — but typed-streams probe suggests opcode-level entropy is already mostly captured), suffix-array optimal parsing (modest gain on top of BT per roadmap's own assessment).
 
 ## Roadmap — next sessions
+
+### Step B — Extend adaptive AC to offset streams
+**Branch:** `feat/adaptive-ac-offsets` · **Expected:** −0.5 to −1.5 pts on PE.
+
+Phase-0 (2026-04-28) measured order-1 byte cond. entropy headroom on `off_lo` of ~6–10 KB and on `off_hi` of ~6–10 KB per PE — second-largest residual after literals. Apply the same LZMA-style adaptive AC, conditioning each offset byte on the prior byte from its own stream. Could also condition on the matching opcode token type (EXACT1 vs EXACT2 vs EXACT, etc.) since offset distributions differ sharply by class — but start with prior-byte context only and measure.
+
+Risk: adaptive AC warm-up is harsher on offset streams (smaller `n` than literals on most files). Likely realises 30–60% of the H0–H1 gap.
+
+### Step C — Adaptive AC for opcode/lbuf streams
+**Branch:** `feat/adaptive-ac-opcodes` · **Expected:** ≤−0.3 pts.
+
+Low payoff per phase-0 (opcode streams already near 0-order optimal under rANS). Do last; only if A+B succeed and we want to retire rANS entirely.
 
 ### ~~Session N+1 — BPE-style trained vocabulary~~ FAILED 2026-04-27 at phase-0
 
