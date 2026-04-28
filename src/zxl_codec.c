@@ -260,6 +260,8 @@ static void rank1_reconstruct(const uint32_t row[16], const uint32_t col[16],
  * dense or rank-1 format encodes fewer total bytes (header + bit cost),
  * run rans_build_tables with whichever counts will actually be encoded,
  * and populate row/col for the header writer. Returns the mode byte. */
+/* Unused after Step C (all-AC) — kept for reference / potential rANS revival. */
+__attribute__((unused))
 static int build_freqs_auto(const uint32_t cnt[256],
                              RansSym syms[256], RansSlot slots[RANS_SCALE],
                              uint32_t row[16], uint32_t col[16])
@@ -315,6 +317,7 @@ static int build_freqs_auto(const uint32_t cnt[256],
 }
 
 /* Write one freq table in the chosen mode. Emits [mode byte][payload]. */
+__attribute__((unused))
 static size_t write_freqs_tagged(uint8_t *dst, int mode,
                                   const RansSym syms[256],
                                   const uint32_t row[16], const uint32_t col[16])
@@ -331,6 +334,7 @@ static size_t write_freqs_tagged(uint8_t *dst, int mode,
 }
 
 /* Decode one freq table. Reads [mode byte][payload], fills cnt[]. */
+__attribute__((unused))
 static size_t read_freqs_tagged(const uint8_t *src, size_t avail, uint32_t cnt[256])
 {
     if (avail < 1) return 0;
@@ -1456,31 +1460,9 @@ static size_t compress_block(MatchCtx *ctx,
         }
     }
 
-    /* Build rANS tables + per-table rank-1/dense mode for the 4 rANS streams.
-     * (off_lo and off_hi are now adaptive AC; literals were already AC.) */
-    int      am_mode, al_mode, delta_mode, len_mode;
-    uint32_t am_row[16], am_col[16], al_row[16], al_col[16];
-    uint32_t delta_row[16], delta_col[16], len_row[16], len_col[16];
-
-    uint32_t am_counts[256] = {0};
-    for (size_t i = 0; i < am_len; i++) am_counts[opcode_am[i]]++;
-    RansSym  am_syms[256];  RansSlot am_slots[RANS_SCALE];
-    am_mode = build_freqs_auto(am_counts, am_syms, am_slots, am_row, am_col);
-
-    uint32_t al_counts[256] = {0};
-    for (size_t i = 0; i < al_len; i++) al_counts[opcode_al[i]]++;
-    RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
-    al_mode = build_freqs_auto(al_counts, al_syms, al_slots, al_row, al_col);
-
-    uint32_t delta_counts[256] = {0};
-    for (size_t i = 0; i < delta_len; i++) delta_counts[delta_buf[i]]++;
-    RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
-    delta_mode = build_freqs_auto(delta_counts, delta_syms, delta_slots, delta_row, delta_col);
-
-    uint32_t len_counts[256] = {0};
-    for (size_t i = 0; i < lbuf_size; i++) len_counts[lbuf[i]]++;
-    RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
-    len_mode = build_freqs_auto(len_counts, len_syms, len_slots, len_row, len_col);
+    /* All entropy streams now adaptive AC (Step C, 2026-04-28). No rANS,
+     * no per-block freq tables. Encoders + decoders share the same
+     * online-learned 256-bin model per stream. */
 
     /* ---- Entropy-code literal stream: adaptive binary range coder ----
      * Each literal byte is bit-tree encoded under a 256-context model
@@ -1515,24 +1497,28 @@ static size_t compress_block(MatchCtx *ctx,
     }
     free(lit_probs);
 
-    /* ---- Encode 2 opcode sub-streams ------------------------------ */
-    #define ENC_OP(name, buf, blen, syms, enc_sz, enc_ptr, cleanup) \
+    /* ---- Encode 2 opcode sub-streams via adaptive AC --------------- */
+    #define ENC_AC(buf, blen, enc_sz, enc_ptr, cleanup) \
         size_t enc_sz = 0; uint8_t *enc_ptr = NULL; \
-        if (blen > 0) { \
-            enc_sz = rans_encode(buf, blen, syms, scratch, scratch_cap); \
-            if (!enc_sz) { cleanup; return 0; } \
-            enc_ptr = (uint8_t *)malloc(enc_sz); \
-            if (!enc_ptr) { cleanup; return 0; } \
-            memcpy(enc_ptr, scratch, enc_sz); \
+        if ((blen) > 0) { \
+            size_t _cap = (blen) + ((blen) >> 4) + 64; \
+            enc_ptr = (uint8_t *)malloc(_cap); \
+            zxl_ac_prob *_p = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob)); \
+            if (!enc_ptr || !_p) { free(enc_ptr); free(_p); cleanup; return 0; } \
+            for (int _k=0; _k<256; _k++) _p[_k] = ZXL_AC_PROB_INIT; \
+            zxl_ac_enc _rc; zxl_ac_enc_init(&_rc, enc_ptr, _cap); \
+            for (size_t _j=0; _j<(blen); _j++) zxl_ac_enc_byte(&_rc, _p, (buf)[_j]); \
+            enc_sz = zxl_ac_enc_finish(&_rc); \
+            free(_p); \
+            if (!enc_sz) { free(enc_ptr); cleanup; return 0; } \
         }
     #define FREE2OP free(opcode_am); free(opcode_al); \
                     free(lit_enc); free(scratch); free(opcode_buf); \
                     free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf)
 
-    ENC_OP(am, opcode_am, am_len, am_syms, enc_opcode_am, opcode_am_enc, FREE2OP)
-    ENC_OP(al, opcode_al, al_len, al_syms, enc_opcode_al, opcode_al_enc,
+    ENC_AC(opcode_am, am_len, enc_opcode_am, opcode_am_enc, FREE2OP)
+    ENC_AC(opcode_al, al_len, enc_opcode_al, opcode_al_enc,
            if(opcode_am_enc)free(opcode_am_enc); FREE2OP)
-    #undef ENC_OP
 
     #define FREE4ALL if(opcode_al_enc)free(opcode_al_enc); \
                      if(opcode_am_enc)free(opcode_am_enc); \
@@ -1576,49 +1562,33 @@ static size_t compress_block(MatchCtx *ctx,
         if (!enc_off_hi) { free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
     }
 
-    /* ---- Encode delta stream (mtype + delta bytes only) ----------- */
-    size_t   enc_delta = 0;
-    uint8_t *delta_enc = NULL;
-    if (delta_len > 0) {
-        enc_delta = rans_encode(delta_buf, delta_len, delta_syms, scratch, scratch_cap);
-        if (!enc_delta) { if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        delta_enc = (uint8_t *)malloc(enc_delta);
-        if (!delta_enc) { if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        memcpy(delta_enc, scratch, enc_delta);
-    }
+    /* ---- Encode delta + length streams via adaptive AC ------------ */
+    ENC_AC(delta_buf, delta_len, enc_delta, delta_enc,
+           if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL)
+    ENC_AC(lbuf, lbuf_size, enc_len, len_enc,
+           if(delta_enc)free(delta_enc); if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL)
 
-    /* ---- Encode length stream ------------------------------------- */
-    size_t   enc_len = 0;
-    uint8_t *len_enc = NULL;
-    if (lbuf_size > 0) {
-        enc_len = rans_encode(lbuf, lbuf_size, len_syms, scratch, scratch_cap);
-        if (!enc_len) { if(delta_enc)free(delta_enc); if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        len_enc = (uint8_t *)malloc(enc_len);
-        if (!len_enc) { if(delta_enc)free(delta_enc); if(off_hi_enc)free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        memcpy(len_enc, scratch, enc_len);
-    }
+    #undef ENC_AC
     #undef FREE4ALL
     #undef FREE2OP
     free(scratch);
 
     /*
-     * Block header (ZXLC, post-adaptive-AC literals):
-     *   [4]×15      fields: uncomp, enc_am, enc_al,
-     *                       enc_off_lo, enc_off_hi, enc_delta, enc_len, lit_ac_size,
-     *                       dec_am, dec_al, dec_off_lo, dec_off_hi, dec_delta, dec_len, dec_lit
-     *   [tagged]×6  freq tables (D1.5): am, al, off_lo, off_hi, delta, len
-     *   streams: am, al, off_lo, off_hi, delta, len, lit_ac
+     * Block header (post-Step C, all-AC):
+     *   [4]×15  fields: uncomp, enc_am, enc_al, enc_off_lo, enc_off_hi,
+     *                   enc_delta, enc_len, lit_ac_size,
+     *                   dec_am, dec_al, dec_off_lo, dec_off_hi,
+     *                   dec_delta, dec_len, dec_lit
+     *   streams: am, al, off_lo, off_hi, delta, len, lit_ac (all AC bytes)
      *
-     *   Literals are coded with a single adaptive binary range coder
-     *   conditioned on the previous output byte (256 contexts, 8-bit
-     *   tree per context, init prob 0.5). No per-block freq tables.
+     *   No per-block freq tables — every entropy stream is now an
+     *   unconditional adaptive AC stream (literals: 256 prev-byte
+     *   contexts; all others: single 256-bin online-learned model).
      *
      *   enc_am == 0 → raw fallback (literal copy at offset 60).
      */
     #define N_HDR_FIELDS 15
-    /* Worst-case freq tables: 1 mode byte + ZXL_COMPACT_FREQ_MAX dense payload per table.
-     * 4 rANS tables (am, al, delta, len). Literals + off_lo + off_hi use AC: no header tables. */
-    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*4;
+    size_t hdr_size = 4*N_HDR_FIELDS;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
     size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
@@ -1660,12 +1630,7 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [13] dec_len */
     write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
-    /* D1.5 compact freq tables for the 4 rANS streams (literals + offsets use AC). */
-    p += write_freqs_tagged(p, am_mode,     am_syms,     am_row,     am_col);
-    p += write_freqs_tagged(p, al_mode,     al_syms,     al_row,     al_col);
-    p += write_freqs_tagged(p, delta_mode,  delta_syms,  delta_row,  delta_col);
-    p += write_freqs_tagged(p, len_mode,    len_syms,    len_row,    len_col);
-
+    /* No freq tables — every stream is adaptive AC bytes. */
     if (opcode_am_enc && enc_opcode_am) { memcpy(p, opcode_am_enc, enc_opcode_am); p += enc_opcode_am; }
     if (opcode_al_enc && enc_opcode_al) { memcpy(p, opcode_al_enc, enc_opcode_al); p += enc_opcode_al; }
     if (off_lo_enc && enc_off_lo) { memcpy(p, off_lo_enc, enc_off_lo); p += enc_off_lo; }
@@ -1746,30 +1711,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     const uint8_t *tp = src + raw_hdr_d;
     const uint8_t *tp_end = src + src_len;
 
-    #define READ_COMPACT_FREQS_INTO(syms_arr, slots_arr)                         \
-        do {                                                                       \
-            uint32_t _cnt[256];                                                    \
-            size_t _consumed = read_freqs_tagged(tp, (size_t)(tp_end - tp), _cnt); \
-            if (_consumed == 0) return 0;                                          \
-            tp += _consumed;                                                       \
-            rans_build_tables(_cnt, (syms_arr), (slots_arr));                      \
-        } while (0)
+    /* No freq tables to read — every stream is now adaptive AC bytes. */
 
-    /* Two opcode freq tables: am, al */
-    RansSym  am_syms[256];  RansSlot am_slots[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(am_syms, am_slots);
-    RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(al_syms, al_slots);
-
-    /* Delta / len freq tables (off_lo + off_hi are adaptive AC, no tables). */
-    RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(delta_syms, delta_slots);
-    RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(len_syms, len_slots);
-
-    #undef READ_COMPACT_FREQS_INTO
-
-    /* Bounds check: all streams must fit (literals are AC, no header tables). */
+    /* Bounds check: all AC streams must fit. */
     size_t need = opcode_am_size + opcode_al_size
                 + off_lo_size + off_hi_size + delta_size + len_size + lit_ac_size;
     if ((size_t)(tp_end - tp) < need) return 0;
@@ -1784,71 +1728,38 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     const uint8_t *len_stream    = tp + op2 + off_lo_size + off_hi_size + delta_size;
     const uint8_t *lit_stream    = tp + op2 + off_lo_size + off_hi_size + delta_size + len_size;
 
-    /* Decode 2 opcode sub-streams */
-    #define DEC_OP(buf, stream, enc_sz, dec_len, slots, cleanup) \
+    /* Generic unconditional adaptive-AC decode helper.
+     * Allocates dst buf, decodes (dec_len) bytes from (stream, enc_sz). */
+    #define DEC_AC(buf, stream, enc_sz, dec_len, cleanup) \
         uint8_t *buf = (uint8_t *)malloc((dec_len) + 64); \
         if (!buf) { cleanup; return 0; } \
-        if ((dec_len) > 0 && rans_decode(stream, enc_sz, slots, buf, dec_len) != 0) { \
-            free(buf); cleanup; return 0; \
+        if ((dec_len) > 0) { \
+            zxl_ac_prob *_pp = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob)); \
+            if (!_pp) { free(buf); cleanup; return 0; } \
+            for (int _k=0; _k<256; _k++) _pp[_k] = ZXL_AC_PROB_INIT; \
+            zxl_ac_dec _rd; \
+            if (zxl_ac_dec_init(&_rd, (stream), (enc_sz)) != 0) { \
+                free(_pp); free(buf); cleanup; return 0; \
+            } \
+            for (uint32_t _j=0; _j<(dec_len); _j++) \
+                buf[_j] = (uint8_t)zxl_ac_dec_byte(&_rd, _pp); \
+            free(_pp); \
         }
-    DEC_OP(opcode_am_buf, opcode_am_stream, opcode_am_size, am_dec_len, am_slots, )
-    DEC_OP(opcode_al_buf, opcode_al_stream, opcode_al_size, al_dec_len, al_slots,
+
+    DEC_AC(opcode_am_buf, opcode_am_stream, opcode_am_size, am_dec_len, )
+    DEC_AC(opcode_al_buf, opcode_al_stream, opcode_al_size, al_dec_len,
            free(opcode_am_buf))
-    #undef DEC_OP
 
     #define FREE2BUF free(opcode_al_buf); free(opcode_am_buf)
 
-    /* Decode offset-lo stream (unconditional adaptive AC). */
-    uint8_t *off_lo_buf_d = NULL;
-    if (off_lo_dec_len > 0) {
-        off_lo_buf_d = (uint8_t *)malloc(off_lo_dec_len + 64);
-        zxl_ac_prob *pp = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
-        if (!off_lo_buf_d || !pp) { free(off_lo_buf_d); free(pp); FREE2BUF; return 0; }
-        for (int k=0; k<256; k++) pp[k] = ZXL_AC_PROB_INIT;
-        zxl_ac_dec rd;
-        if (zxl_ac_dec_init(&rd, off_lo_stream, off_lo_size) != 0) {
-            free(off_lo_buf_d); free(pp); FREE2BUF; return 0;
-        }
-        for (uint32_t j=0; j<off_lo_dec_len; j++)
-            off_lo_buf_d[j] = (uint8_t)zxl_ac_dec_byte(&rd, pp);
-        free(pp);
-    }
-
-    /* Decode offset-hi stream (unconditional adaptive AC). */
-    uint8_t *off_hi_buf_d = NULL;
-    if (off_hi_dec_len > 0) {
-        off_hi_buf_d = (uint8_t *)malloc(off_hi_dec_len + 64);
-        zxl_ac_prob *pp = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
-        if (!off_hi_buf_d || !pp) { free(off_hi_buf_d); free(pp); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
-        for (int k=0; k<256; k++) pp[k] = ZXL_AC_PROB_INIT;
-        zxl_ac_dec rd;
-        if (zxl_ac_dec_init(&rd, off_hi_stream, off_hi_size) != 0) {
-            free(off_hi_buf_d); free(pp); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
-        }
-        for (uint32_t j=0; j<off_hi_dec_len; j++)
-            off_hi_buf_d[j] = (uint8_t)zxl_ac_dec_byte(&rd, pp);
-        free(pp);
-    }
-
-    /* Decode delta stream — mtype+deltaval bytes */
-    uint8_t *delta_buf = NULL;
-    if (delta_dec_len > 0) {
-        delta_buf = (uint8_t *)malloc(delta_dec_len + 64);
-        if (!delta_buf) { if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
-        if (rans_decode(delta_stream, delta_size, delta_slots, delta_buf, delta_dec_len) != 0) {
-            free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
-        }
-    }
-
-    /* Decode len stream — match length bytes */
-    uint8_t *len_buf = NULL;
-    if (len_dec_len > 0) {
-        len_buf = (uint8_t *)malloc(len_dec_len + 64);
-        if (!len_buf) { if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
-        if (rans_decode(len_stream, len_size, len_slots, len_buf, len_dec_len) != 0) {
-            free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
-        }
-    }
+    DEC_AC(off_lo_buf_d, off_lo_stream, off_lo_size, off_lo_dec_len, FREE2BUF)
+    DEC_AC(off_hi_buf_d, off_hi_stream, off_hi_size, off_hi_dec_len,
+           free(off_lo_buf_d); FREE2BUF)
+    DEC_AC(delta_buf,    delta_stream,  delta_size,  delta_dec_len,
+           free(off_hi_buf_d); free(off_lo_buf_d); FREE2BUF)
+    DEC_AC(len_buf,      len_stream,    len_size,    len_dec_len,
+           free(delta_buf); free(off_hi_buf_d); free(off_lo_buf_d); FREE2BUF)
+    #undef DEC_AC
 
     /* Initialise adaptive AC for literals: 256 contexts × 8-bit tree (256 prob slots/ctx). */
     zxl_ac_prob (*lit_probs)[256] = (zxl_ac_prob (*)[256])malloc(256 * 256 * sizeof(zxl_ac_prob));
