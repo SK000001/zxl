@@ -18,7 +18,6 @@ endif
 TARGET  = zxl$(EXE)
 SRCS    = src/main.c \
           src/zxl_match.c \
-          src/zxl_rans.c \
           src/zxl_ac.c \
           src/zxl_codec.c
 
