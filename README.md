@@ -2,15 +2,15 @@
 
 A lossless binary compression codec tuned for x86/x64 PE executables. Written in C, no external dependencies.
 
-Beats gzip-9, zstd-9, bzip2-9 on every PE benchmark file. **Beats zstd-19 on ntdll.dll and user32.dll**; within 0.5 pt of zstd-19 on kernel32.
+**Beats gzip-9, zstd-9, bzip2-9, and zstd-19 on every PE benchmark file.** Closing on xz-9e.
 
-## Current benchmarks (post adaptive-AC offsets, 2026-04-28)
+## Current benchmarks (post all-AC retire of rANS, 2026-04-28)
 
 | File         | Size    | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------:|-------:|-------:|-------:|--------:|--------:|-------:|
-| ntdll.dll    | 2.52 MB | **0.3967** | 0.4596 | 0.4442 | 0.4346 | 0.4013 | 0.3772 |
-| kernel32.dll | 836 KB  | **0.4068** | 0.4574 | 0.4455 | 0.4416 | 0.4024 | 0.3785 |
-| user32.dll   | 1.87 MB | **0.3306** | 0.3852 | 0.3630 | 0.3651 | 0.3312 | 0.3065 |
+| ntdll.dll    | 2.52 MB | **0.3928** | 0.4596 | 0.4442 | 0.4346 | 0.4013 | 0.3772 |
+| kernel32.dll | 836 KB  | **0.4020** | 0.4574 | 0.4455 | 0.4416 | 0.4024 | 0.3785 |
+| user32.dll   | 1.87 MB | **0.3272** | 0.3852 | 0.3630 | 0.3651 | 0.3312 | 0.3065 |
 
 Ratios shown as compressed / original (lower is better).
 

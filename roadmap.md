@@ -5,17 +5,17 @@ Replaces the old PHASES.md (folded in here).
 
 ---
 
-## Current state (2026-04-28, post adaptive-AC offsets)
+## Current state (2026-04-28, post all-AC retirement of rANS)
 
 | File         | ZXL    | gzip-9 | zstd-9 | bzip2-9 | zstd-19 | xz-9e  |
 |--------------|--------|--------|--------|---------|---------|--------|
-| ntdll.dll    | 0.3967 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
-| kernel32.dll | 0.4068 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
-| user32.dll   | 0.3306 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
+| ntdll.dll    | 0.3928 | 0.4596 | 0.4442 | 0.4346  | 0.4013  | 0.3772 |
+| kernel32.dll | 0.4020 | 0.4574 | 0.4455 | 0.4416  | 0.4024  | 0.3785 |
+| user32.dll   | 0.3272 | 0.3852 | 0.3630 | 0.3651  | 0.3312  | 0.3065 |
 
-- Beats gzip-9, zstd-9, bzip2-9, **and zstd-19** on ntdll and user32. kernel32 within +0.44 pts of zstd-19.
-- Gap to xz-9e: +1.95 / +2.83 / +2.41 pts (was +3.26 / +4.51 / +3.54 before adaptive AC).
-- Adaptive AC literals + offsets also won unanimously on small files vs the post-D1.5 baseline: test.js −1.92, test.json −0.40, test.pdf −0.42, test.png −1.12 pts.
+- **Beats zstd-19 on all three PE files** (ntdll −0.85, kernel32 −0.04, user32 −0.40 pts vs zstd-19).
+- Gap to xz-9e: +1.56 / +2.35 / +2.07 pts (was +3.26 / +4.51 / +3.54 before any AC; the three-step adaptive-AC retire of rANS closed roughly half the gap to xz-9e).
+- Small-file ratios also improved unanimously: test.js 0.3083 (−2.30 pts vs pre-AC), test.json 0.2055 (−0.57), test.pdf 0.9465 (−0.77), test.png 0.9756 (−1.36 pts).
 
 ---
 
@@ -38,6 +38,7 @@ Format tricks:
 - B5 PE-section-aware block boundaries — parses PE section table and forces block splits at section starts (guarded by 512 KB min-block). Each block's freq tables specialize to one section's statistics.
 - **Adaptive AC literals (2026-04-28)** — replaces the 16-context (prev_byte>>4 nibble) rANS literal sub-streams with a single LZMA-style adaptive binary range coder over 256 prev-byte contexts (8-bit tree per context, 11-bit prob precision, MOVE_BITS=5 update). Drops 16 per-block freq tables. Won −1.03 / −1.26 / −0.89 pts on PE; −0.15 to −1.74 on every small file. Phase-0 ceiling was 5.2 / 7.2 / 6.5 pts (order-1 byte cond. entropy); realised ~20% — small sub-streams' AC warm-up + byte-only context cap the immediate gain.
 - **Adaptive AC offsets (2026-04-28, Step B)** — same range coder applied to off_lo + off_hi. Initially tried 256 prev-byte contexts (mirroring literal model); regressed on most files. Walked context count down through 16/8/4/2/1; ratio improved monotonically. **Final: pure unconditional adaptive AC** — single 256-bin online-learned model per stream, no cross-symbol context. At 30K-140K samples per stream, byte-pair correlations are noise that AC's online learning can't separate from signal. The win comes from online drift adaptation + dropping 2 per-block freq tables (~300 B), biggest impact on kernel32's single-block layout. Won −0.28 / −0.42 / −0.24 pts on PE on top of Step A.
+- **Adaptive AC opcode/delta/lbuf — rANS fully retired (2026-04-28, Step C)** — same unconditional adaptive AC applied to opcode_am, opcode_al, delta, lbuf. Phase-0 said headroom was small (these streams were already near 0-order optimal under rANS), but Step B's tuning result generalised: dropped 4 more freq tables, online-drift adaptation still wins. Result: −0.39 / −0.48 / −0.34 pts on PE on top of Step B; ZXL now beats zstd-19 on all three PE files. Static rANS path is unused (helpers `__attribute__((unused))`-marked); full removal of zxl_rans.{c,h} is a follow-up.
 
 ---
 
@@ -73,15 +74,20 @@ The remaining "Further out" items: instruction-level LZ (x86 decoder, multi-week
 
 ## Roadmap — next sessions
 
-### Step C — Adaptive AC for opcode/lbuf streams
-**Branch:** `feat/adaptive-ac-opcodes` · **Expected:** ≤−0.2 pts.
+### Cleanup — Remove dead rANS infrastructure
+**Branch:** `chore/remove-rans` · **Expected:** no ratio impact (pure cleanup).
 
-Low payoff per phase-0 (opcode streams already near 0-order optimal under rANS). Step B's tuning result (unconditional adaptive AC won) suggests these streams might also benefit from AC's online drift adaptation + header savings. Try unconditional first.
+After Step C, zxl_rans.c/h is unreachable, plus `build_freqs_auto`, `write_freqs_tagged`, `read_freqs_tagged` and their helper chain (`rank1_reconstruct`, varint helpers, compact-freq helpers) in zxl_codec.c. Delete; trim Makefile. Reduces source by ~600 LOC.
 
-### Step D — Probe context conditioning by opcode token type
+### Step D — Context conditioning by opcode token type
 **Expected:** speculative.
 
-Step B's surprise result (cross-symbol byte context didn't help offsets) hints that the right context for offsets is *which match-token class produced this byte*, not the prior byte. EXACT1 offsets are 0-255; EXACT2 are 0-65535; etc — sharply different distributions. Threading the token class through to the AC encode point is non-trivial wiring. Phase-0 first: measure conditional entropy of offset bytes given token class.
+Step B's surprise result (cross-symbol byte context didn't help offsets) hints that the right context for offsets is *which match-token class produced this byte*, not the prior byte. EXACT1 offsets are 0-255; EXACT2 are 0-65535; etc — sharply different distributions. Threading the token class through to the AC encode point requires re-ordering: instead of separate buffered streams, AC-encode bytes inline with their type known. Phase-0 first: measure conditional entropy of offset bytes given token class.
+
+### Step E — Bit-level context within AC encode
+**Expected:** speculative.
+
+Within the bit-tree decomposition of each byte, condition the bit-tree probabilities on additional state (e.g., for offsets, on bit position; for literals, on the partial byte built up so far inside another stream). Genuine sub-byte conditioning. Multi-week.
 
 ### ~~Session N+1 — BPE-style trained vocabulary~~ FAILED 2026-04-27 at phase-0
 
