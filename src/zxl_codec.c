@@ -36,6 +36,7 @@
 #include "zxl.h"
 #include "zxl_match.h"
 #include "zxl_rans.h"
+#include "zxl_ac.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1205,7 +1206,8 @@ static size_t compress_block(MatchCtx *ctx,
                 uint8_t ch = choice[i];
                 if (ch == 0) {
                     uint8_t b = src[block_start + i];
-                    lit_ctx_buf[lit_len] = prev_out >> N_LIT_CTX_SHIFT;
+                    /* Adaptive AC: store full prev byte as 8-bit context. */
+                    lit_ctx_buf[lit_len] = prev_out;
                     lit_buf[lit_len++]   = b;
                     prev_out = b;
                     lit_run++;
@@ -1490,62 +1492,38 @@ static size_t compress_block(MatchCtx *ctx,
     RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
     len_mode = build_freqs_auto(len_counts, len_syms, len_slots, len_row, len_col);
 
-    /* ---- Entropy-code literal stream: N_LIT_CTX context models ----
-     * Split lit_buf into N_LIT_CTX sub-streams by (prev_byte >> N_LIT_CTX_SHIFT).
-     * Each sub-stream has its own rANS frequency table, reducing literal entropy
-     * by exploiting byte-pair correlations in binary/PE data. */
+    /* ---- Entropy-code literal stream: adaptive binary range coder ----
+     * Each literal byte is bit-tree encoded under a 256-context model
+     * keyed on the previous output byte (lit_ctx_buf[i]). Adaptive
+     * probabilities (LZMA-style, 11-bit precision) eliminate per-block
+     * frequency-table overhead and exploit cross-symbol structure beyond
+     * the 4-bit nibble context the prior 16-stream rANS model used. */
     size_t scratch_cap = zxl_bound(block_len + lit_len + off_lo_len + off_hi_len + delta_len);
     uint8_t *scratch = (uint8_t *)malloc(scratch_cap);
     if (!scratch) { free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
 
-    /* Count and partition literals into N_LIT_CTX sub-streams */
-    size_t lit_sub_len[N_LIT_CTX]; memset(lit_sub_len, 0, sizeof(lit_sub_len));
-    size_t lit_sub_off[N_LIT_CTX];
-    for (size_t j = 0; j < lit_len; j++) lit_sub_len[lit_ctx_buf[j]]++;
-    { size_t cum = 0; for (int c = 0; c < N_LIT_CTX; c++) { lit_sub_off[c] = cum; cum += lit_sub_len[c]; } }
-
-    uint8_t *lit_sub = (uint8_t *)malloc(lit_len + N_LIT_CTX);
-    if (!lit_sub) { free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
-    { size_t idx[N_LIT_CTX]; for (int c = 0; c < N_LIT_CTX; c++) idx[c] = lit_sub_off[c];
-      for (size_t j = 0; j < lit_len; j++) {
-          uint8_t ctx = lit_ctx_buf[j];
-          lit_sub[idx[ctx]++] = lit_buf[j];
-      }
+    size_t   lit_ac_cap = lit_len + (lit_len >> 4) + 64;
+    uint8_t *lit_enc    = (uint8_t *)malloc(lit_ac_cap);
+    zxl_ac_prob (*lit_probs)[256] = (zxl_ac_prob (*)[256])malloc(256 * 256 * sizeof(zxl_ac_prob));
+    if (!lit_enc || !lit_probs) {
+        free(lit_enc); free(lit_probs);
+        free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
     }
-
-    /* Heap-allocate syms table: N_LIT_CTX × 256 × sizeof(RansSym) = 64KB with 64 contexts */
-    RansSym (*lit_syms_ctx)[256] = (RansSym (*)[256])malloc(N_LIT_CTX * 256 * sizeof(RansSym));
-    size_t   lit_enc_sz[N_LIT_CTX]; memset(lit_enc_sz, 0, sizeof(lit_enc_sz));
-    size_t   lit_enc_total = 0;
-    uint8_t *lit_enc = (lit_syms_ctx) ? (uint8_t *)malloc(scratch_cap) : NULL;
-    if (!lit_syms_ctx || !lit_enc) {
-        free(lit_syms_ctx); free(lit_enc);
-        free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
-    }
-    int       lit_mode[N_LIT_CTX];
-    uint32_t  lit_row [N_LIT_CTX][16];
-    uint32_t  lit_col [N_LIT_CTX][16];
+    for (int c = 0; c < 256; c++) for (int k = 0; k < 256; k++) lit_probs[c][k] = ZXL_AC_PROB_INIT;
+    size_t lit_enc_total = 0;
     {
-        RansSlot *tmp_slots = (RansSlot *)malloc(RANS_SCALE * sizeof(RansSlot));
-        if (!tmp_slots) { free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
-        for (int c = 0; c < N_LIT_CTX; c++) {
-            uint32_t cnt[256] = {0};
-            for (size_t j = 0; j < lit_sub_len[c]; j++)
-                cnt[lit_sub[lit_sub_off[c] + j]]++;
-            lit_mode[c] = build_freqs_auto(cnt, lit_syms_ctx[c], tmp_slots,
-                                            lit_row[c], lit_col[c]);
-            if (lit_sub_len[c] > 0) {
-                size_t enc = rans_encode(lit_sub + lit_sub_off[c], lit_sub_len[c],
-                                         lit_syms_ctx[c], scratch, scratch_cap);
-                if (!enc) { free(tmp_slots); free(lit_syms_ctx); free(lit_enc); free(lit_sub); free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0; }
-                memcpy(lit_enc + lit_enc_total, scratch, enc);
-                lit_enc_sz[c] = enc;
-                lit_enc_total += enc;
-            }
+        zxl_ac_enc rc;
+        zxl_ac_enc_init(&rc, lit_enc, lit_ac_cap);
+        for (size_t j = 0; j < lit_len; j++) {
+            zxl_ac_enc_byte(&rc, lit_probs[lit_ctx_buf[j]], lit_buf[j]);
         }
-        free(tmp_slots);
+        lit_enc_total = zxl_ac_enc_finish(&rc);
+        if (lit_len > 0 && lit_enc_total == 0) {
+            free(lit_probs); free(lit_enc);
+            free(scratch); free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf); return 0;
+        }
     }
-    free(lit_sub);
+    free(lit_probs);
 
     /* ---- Encode 2 opcode sub-streams ------------------------------ */
     #define ENC_OP(name, buf, blen, syms, enc_sz, enc_ptr, cleanup) \
@@ -1618,21 +1596,23 @@ static size_t compress_block(MatchCtx *ctx,
     free(scratch);
 
     /*
-     * Block header (ZXLC):
-     *   [4]×15            fields: uncomp, enc_am, enc_al,
-     *                             enc_off_lo, enc_off_hi, enc_delta, enc_len, lit_enc_total,
-     *                             dec_am, dec_al, dec_off_lo, dec_off_hi, dec_delta, dec_len, dec_lit
-     *   [256*2]×6         freq tables: am, al, off_lo, off_hi, delta, len
-     *   [N_LIT_CTX*256*2] literal freq tables
-     *   [N_LIT_CTX*4]×2   lit sub-stream sizes (compressed + decoded)
-     *   streams: am, al, off_lo, off_hi, delta, len, lit[0..N-1]
+     * Block header (ZXLC, post-adaptive-AC literals):
+     *   [4]×15      fields: uncomp, enc_am, enc_al,
+     *                       enc_off_lo, enc_off_hi, enc_delta, enc_len, lit_ac_size,
+     *                       dec_am, dec_al, dec_off_lo, dec_off_hi, dec_delta, dec_len, dec_lit
+     *   [tagged]×6  freq tables (D1.5): am, al, off_lo, off_hi, delta, len
+     *   streams: am, al, off_lo, off_hi, delta, len, lit_ac
      *
-     *   enc_am == 0 → raw fallback (literal copy at offset 60)
+     *   Literals are coded with a single adaptive binary range coder
+     *   conditioned on the previous output byte (256 contexts, 8-bit
+     *   tree per context, init prob 0.5). No per-block freq tables.
+     *
+     *   enc_am == 0 → raw fallback (literal copy at offset 60).
      */
     #define N_HDR_FIELDS 15
     /* Worst-case freq tables: 1 mode byte + ZXL_COMPACT_FREQ_MAX dense payload per table.
-     * 6 main tables (am, al, off_lo, off_hi, delta, len) + N_LIT_CTX literal tables. */
-    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*(6 + N_LIT_CTX) + N_LIT_CTX*4*2;
+     * 6 main tables (am, al, off_lo, off_hi, delta, len). Literals use AC: no header tables. */
+    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*6;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
     size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
@@ -1644,14 +1624,14 @@ static size_t compress_block(MatchCtx *ctx,
         if (opcode_al_enc) free(opcode_al_enc);
         if (opcode_am_enc) free(opcode_am_enc);
         free(opcode_am); free(opcode_al);
-        free(lit_syms_ctx); free(lit_enc);
+        free(lit_enc);
         free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
         /* Raw fallback: enc_am=0 signals no compression; raw data at offset N_HDR_FIELDS*4 */
         size_t raw_hdr = (size_t)(N_HDR_FIELDS * 4);
         if (block_len + raw_hdr > dst_cap) return 0;
         for (int _i = 0; _i < N_HDR_FIELDS; _i++) write_u32(dst + _i*4, 0);
         write_u32(dst,    (uint32_t)block_len);              /* uncomp_size */
-        write_u32(dst+28, (uint32_t)block_len);              /* lit_enc_total (field [7]) */
+        write_u32(dst+28, (uint32_t)block_len);              /* lit_ac_size (field [7]) */
         write_u32(dst+(N_HDR_FIELDS-1)*4, (uint32_t)block_len); /* dec_lit */
         memcpy(dst+raw_hdr, src + block_start, block_len);
         return raw_hdr + block_len;
@@ -1665,7 +1645,7 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)enc_off_hi);        p += 4;  /* [4]  enc_off_hi */
     write_u32(p, (uint32_t)enc_delta);         p += 4;  /* [5]  enc_delta */
     write_u32(p, (uint32_t)enc_len);           p += 4;  /* [6]  enc_len */
-    write_u32(p, (uint32_t)lit_enc_total);     p += 4;  /* [7]  lit_enc_total */
+    write_u32(p, (uint32_t)lit_enc_total);     p += 4;  /* [7]  lit_ac_size */
     write_u32(p, (uint32_t)am_len);            p += 4;  /* [8]  dec_am */
     write_u32(p, (uint32_t)al_len);            p += 4;  /* [9]  dec_al */
     write_u32(p, (uint32_t)off_lo_len);        p += 4;  /* [10] dec_off_lo */
@@ -1674,17 +1654,13 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [13] dec_len */
     write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
-    /* D1: compact (bitmap + varint) freq tables. */
+    /* D1.5 compact freq tables for the 6 rANS streams (literals use AC, no table). */
     p += write_freqs_tagged(p, am_mode,     am_syms,     am_row,     am_col);
     p += write_freqs_tagged(p, al_mode,     al_syms,     al_row,     al_col);
     p += write_freqs_tagged(p, off_lo_mode, off_lo_syms, off_lo_row, off_lo_col);
     p += write_freqs_tagged(p, off_hi_mode, off_hi_syms, off_hi_row, off_hi_col);
     p += write_freqs_tagged(p, delta_mode,  delta_syms,  delta_row,  delta_col);
     p += write_freqs_tagged(p, len_mode,    len_syms,    len_row,    len_col);
-    for (int c = 0; c < N_LIT_CTX; c++)
-        p += write_freqs_tagged(p, lit_mode[c], lit_syms_ctx[c], lit_row[c], lit_col[c]);
-    for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_enc_sz[c]);  p += 4; }
-    for (int c = 0; c < N_LIT_CTX; c++) { write_u32(p, (uint32_t)lit_sub_len[c]); p += 4; }
 
     if (opcode_am_enc && enc_opcode_am) { memcpy(p, opcode_am_enc, enc_opcode_am); p += enc_opcode_am; }
     if (opcode_al_enc && enc_opcode_al) { memcpy(p, opcode_al_enc, enc_opcode_al); p += enc_opcode_al; }
@@ -1701,7 +1677,7 @@ static size_t compress_block(MatchCtx *ctx,
     if (opcode_al_enc) free(opcode_al_enc);
     if (opcode_am_enc) free(opcode_am_enc);
     free(opcode_am); free(opcode_al);
-    free(lit_syms_ctx); free(lit_enc);
+    free(lit_enc);
     free(opcode_buf); free(off_lo_buf); free(off_hi_buf); free(delta_buf); free(lbuf); free(lit_buf); free(lit_ctx_buf);
     #undef N_HDR_FIELDS
     return (size_t)(p - dst);
@@ -1742,7 +1718,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint32_t off_hi_size     = read_u32(src + 16);
     uint32_t delta_size      = read_u32(src + 20);
     uint32_t len_size        = read_u32(src + 24);
-    uint32_t lit_size        = read_u32(src + 28);
+    uint32_t lit_ac_size     = read_u32(src + 28);   /* AC stream size */
     uint32_t am_dec_len      = read_u32(src + 32);
     uint32_t al_dec_len      = read_u32(src + 36);
     uint32_t off_lo_dec_len  = read_u32(src + 40);
@@ -1755,10 +1731,10 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
 
     /* Uncompressed fallback (enc_am == 0) */
     if (opcode_am_size == 0) {
-        if (src_len < raw_hdr_d + lit_size) return 0;
-        memcpy(dst + global_out_pos, src + raw_hdr_d, lit_size);
-        *consumed = raw_hdr_d + lit_size;
-        return lit_size;
+        if (src_len < raw_hdr_d + lit_ac_size) return 0;
+        memcpy(dst + global_out_pos, src + raw_hdr_d, lit_ac_size);
+        *consumed = raw_hdr_d + lit_ac_size;
+        return lit_ac_size;
     }
 
     /* D1 compact freq tables: sizes are variable. We use a bounds-check on each
@@ -1793,26 +1769,10 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
 
     #undef READ_COMPACT_FREQS_INTO
 
-    /* N_LIT_CTX literal freq tables → slot tables on heap */
-    RansSlot *lit_slots_all = (RansSlot *)malloc(N_LIT_CTX * RANS_SCALE * sizeof(RansSlot));
-    if (!lit_slots_all) return 0;
-    for (int c = 0; c < N_LIT_CTX; c++) {
-        RansSym  syms[256];  uint32_t cnt[256];
-        size_t consumed = read_freqs_tagged(tp, (size_t)(tp_end - tp), cnt);
-        if (consumed == 0) { free(lit_slots_all); return 0; }
-        tp += consumed;
-        rans_build_tables(cnt, syms, lit_slots_all + c * RANS_SCALE);
-    }
-
-    /* Bounds check: lit-size tables + all streams must fit */
-    size_t need = (size_t)(N_LIT_CTX * 4 * 2)
-                + opcode_am_size + opcode_al_size
-                + off_lo_size + off_hi_size + delta_size + len_size + lit_size;
-    if ((size_t)(tp_end - tp) < need) { free(lit_slots_all); return 0; }
-
-    uint32_t lit_enc_sz[N_LIT_CTX], lit_dec_sz[N_LIT_CTX];
-    for (int c = 0; c < N_LIT_CTX; c++) { lit_enc_sz[c] = read_u32(tp); tp += 4; }
-    for (int c = 0; c < N_LIT_CTX; c++) { lit_dec_sz[c] = read_u32(tp); tp += 4; }
+    /* Bounds check: all streams must fit (literals are AC, no header tables). */
+    size_t need = opcode_am_size + opcode_al_size
+                + off_lo_size + off_hi_size + delta_size + len_size + lit_ac_size;
+    if ((size_t)(tp_end - tp) < need) return 0;
 
     size_t hdr_consumed = (size_t)(tp - src);  /* total variable header size */
     const uint8_t *opcode_am_stream = tp;
@@ -1827,9 +1787,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     /* Decode 2 opcode sub-streams */
     #define DEC_OP(buf, stream, enc_sz, dec_len, slots, cleanup) \
         uint8_t *buf = (uint8_t *)malloc((dec_len) + 64); \
-        if (!buf) { cleanup; free(lit_slots_all); return 0; } \
+        if (!buf) { cleanup; return 0; } \
         if ((dec_len) > 0 && rans_decode(stream, enc_sz, slots, buf, dec_len) != 0) { \
-            free(buf); cleanup; free(lit_slots_all); return 0; \
+            free(buf); cleanup; return 0; \
         }
     DEC_OP(opcode_am_buf, opcode_am_stream, opcode_am_size, am_dec_len, am_slots, )
     DEC_OP(opcode_al_buf, opcode_al_stream, opcode_al_size, al_dec_len, al_slots,
@@ -1842,9 +1802,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *off_lo_buf_d = NULL;
     if (off_lo_dec_len > 0) {
         off_lo_buf_d = (uint8_t *)malloc(off_lo_dec_len + 64);
-        if (!off_lo_buf_d) { FREE2BUF; free(lit_slots_all); return 0; }
+        if (!off_lo_buf_d) { FREE2BUF; return 0; }
         if (rans_decode(off_lo_stream, off_lo_size, off_lo_slots_d, off_lo_buf_d, off_lo_dec_len) != 0) {
-            free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
+            free(off_lo_buf_d); FREE2BUF; return 0;
         }
     }
 
@@ -1852,9 +1812,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *off_hi_buf_d = NULL;
     if (off_hi_dec_len > 0) {
         off_hi_buf_d = (uint8_t *)malloc(off_hi_dec_len + 64);
-        if (!off_hi_buf_d) { if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
+        if (!off_hi_buf_d) { if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
         if (rans_decode(off_hi_stream, off_hi_size, off_hi_slots_d, off_hi_buf_d, off_hi_dec_len) != 0) {
-            free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
+            free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
         }
     }
 
@@ -1862,9 +1822,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *delta_buf = NULL;
     if (delta_dec_len > 0) {
         delta_buf = (uint8_t *)malloc(delta_dec_len + 64);
-        if (!delta_buf) { if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
+        if (!delta_buf) { if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
         if (rans_decode(delta_stream, delta_size, delta_slots, delta_buf, delta_dec_len) != 0) {
-            free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
+            free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
         }
     }
 
@@ -1872,33 +1832,19 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     uint8_t *len_buf = NULL;
     if (len_dec_len > 0) {
         len_buf = (uint8_t *)malloc(len_dec_len + 64);
-        if (!len_buf) { if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
+        if (!len_buf) { if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
         if (rans_decode(len_stream, len_size, len_slots, len_buf, len_dec_len) != 0) {
-            free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
+            free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
         }
     }
 
-    /* Decode N_LIT_CTX literal sub-streams into flat buffer */
-    uint8_t *lit_flat = (uint8_t *)malloc(lit_dec_len + N_LIT_CTX);
-    if (!lit_flat) { if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0; }
-    size_t lit_sub_idx[N_LIT_CTX];
-    {
-        const uint8_t *sub_src = lit_stream;
-        size_t cum = 0;
-        for (int c = 0; c < N_LIT_CTX; c++) {
-            lit_sub_idx[c] = cum;
-            if (lit_dec_sz[c] > 0) {
-                if (rans_decode(sub_src, lit_enc_sz[c],
-                                lit_slots_all + c * RANS_SCALE,
-                                lit_flat + cum, lit_dec_sz[c]) != 0) {
-                    free(lit_flat); if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; free(lit_slots_all); return 0;
-                }
-            }
-            sub_src += lit_enc_sz[c];
-            cum     += lit_dec_sz[c];
-        }
-    }
-    free(lit_slots_all);
+    /* Initialise adaptive AC for literals: 256 contexts × 8-bit tree (256 prob slots/ctx). */
+    zxl_ac_prob (*lit_probs)[256] = (zxl_ac_prob (*)[256])malloc(256 * 256 * sizeof(zxl_ac_prob));
+    if (!lit_probs) { if(len_buf)free(len_buf); if(delta_buf)free(delta_buf); if(off_hi_buf_d)free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
+    for (int c = 0; c < 256; c++) for (int k = 0; k < 256; k++) lit_probs[c][k] = ZXL_AC_PROB_INIT;
+    zxl_ac_dec rd;
+    int rd_ok = (zxl_ac_dec_init(&rd, lit_stream, lit_ac_size) == 0);
+    (void)lit_dec_len;
 
     /* Reconstruct output.
      * Opcodes are read from two sub-streams based on context:
@@ -2046,8 +1992,9 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
             /* Literal run (tok in 0x00..0xF6, run=tok+1): pull from context sub-stream */
             uint32_t run = (uint32_t)tok + 1;
             if (out_pos + run > out_end) break;
+            if (!rd_ok) break;
             for (uint32_t k = 0; k < run; k++) {
-                uint8_t b = lit_flat[lit_sub_idx[prev_out >> N_LIT_CTX_SHIFT]++];
+                uint8_t b = (uint8_t)zxl_ac_dec_byte(&rd, lit_probs[prev_out]);
                 dst[out_pos + k] = b;
                 prev_out = b;
             }
@@ -2061,10 +2008,10 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     if (off_hi_buf_d) free(off_hi_buf_d);
     if (delta_buf) free(delta_buf);
     if (len_buf)   free(len_buf);
-    free(lit_flat);
+    free(lit_probs);
 
     *consumed = hdr_consumed + opcode_am_size + opcode_al_size
-                    + off_lo_size + off_hi_size + delta_size + len_size + lit_size;
+                    + off_lo_size + off_hi_size + delta_size + len_size + lit_ac_size;
     return out_pos - global_out_pos;
 }
 
