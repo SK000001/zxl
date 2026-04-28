@@ -1456,10 +1456,10 @@ static size_t compress_block(MatchCtx *ctx,
         }
     }
 
-    /* Build rANS tables + per-table rank-1/dense mode. */
-    int      am_mode, al_mode, off_lo_mode, off_hi_mode, delta_mode, len_mode;
+    /* Build rANS tables + per-table rank-1/dense mode for the 4 rANS streams.
+     * (off_lo and off_hi are now adaptive AC; literals were already AC.) */
+    int      am_mode, al_mode, delta_mode, len_mode;
     uint32_t am_row[16], am_col[16], al_row[16], al_col[16];
-    uint32_t off_lo_row[16], off_lo_col[16], off_hi_row[16], off_hi_col[16];
     uint32_t delta_row[16], delta_col[16], len_row[16], len_col[16];
 
     uint32_t am_counts[256] = {0};
@@ -1471,16 +1471,6 @@ static size_t compress_block(MatchCtx *ctx,
     for (size_t i = 0; i < al_len; i++) al_counts[opcode_al[i]]++;
     RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
     al_mode = build_freqs_auto(al_counts, al_syms, al_slots, al_row, al_col);
-
-    uint32_t off_lo_counts[256] = {0};
-    for (size_t i = 0; i < off_lo_len; i++) off_lo_counts[off_lo_buf[i]]++;
-    RansSym  off_lo_syms[256]; RansSlot off_lo_slots[RANS_SCALE];
-    off_lo_mode = build_freqs_auto(off_lo_counts, off_lo_syms, off_lo_slots, off_lo_row, off_lo_col);
-
-    uint32_t off_hi_counts[256] = {0};
-    for (size_t i = 0; i < off_hi_len; i++) off_hi_counts[off_hi_buf[i]]++;
-    RansSym  off_hi_syms[256]; RansSlot off_hi_slots[RANS_SCALE];
-    off_hi_mode = build_freqs_auto(off_hi_counts, off_hi_syms, off_hi_slots, off_hi_row, off_hi_col);
 
     uint32_t delta_counts[256] = {0};
     for (size_t i = 0; i < delta_len; i++) delta_counts[delta_buf[i]]++;
@@ -1548,26 +1538,42 @@ static size_t compress_block(MatchCtx *ctx,
                      if(opcode_am_enc)free(opcode_am_enc); \
                      FREE2OP
 
-    /* ---- Encode offset-lo stream ----------------------------------- */
+    /* ---- Encode offset-lo + offset-hi via adaptive AC --------------- *
+     * Unconditional: a single 256-bin online-learned model per stream.
+     * Cross-symbol byte conditioning was tried (16/8/4/2 buckets via
+     * prev>>shift) and progressively *worsened* the ratio — at 30K-140K
+     * samples per stream, prev-byte correlations are too noisy to beat
+     * the warm-up cost. Pure adaptive AC still wins ~0.24-0.42 pts on
+     * PE over static rANS, both via online drift adaptation and the
+     * dropped per-block freq tables. */
     size_t   enc_off_lo = 0;
     uint8_t *off_lo_enc = NULL;
     if (off_lo_len > 0) {
-        enc_off_lo = rans_encode(off_lo_buf, off_lo_len, off_lo_syms, scratch, scratch_cap);
-        if (!enc_off_lo) { FREE4ALL; return 0; }
-        off_lo_enc = (uint8_t *)malloc(enc_off_lo);
-        if (!off_lo_enc) { FREE4ALL; return 0; }
-        memcpy(off_lo_enc, scratch, enc_off_lo);
+        size_t cap = off_lo_len + (off_lo_len >> 4) + 64;
+        off_lo_enc = (uint8_t *)malloc(cap);
+        zxl_ac_prob *p = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
+        if (!off_lo_enc || !p) { free(off_lo_enc); free(p); FREE4ALL; return 0; }
+        for (int k=0; k<256; k++) p[k] = ZXL_AC_PROB_INIT;
+        zxl_ac_enc rc; zxl_ac_enc_init(&rc, off_lo_enc, cap);
+        for (size_t j=0; j<off_lo_len; j++) zxl_ac_enc_byte(&rc, p, off_lo_buf[j]);
+        enc_off_lo = zxl_ac_enc_finish(&rc);
+        free(p);
+        if (!enc_off_lo) { free(off_lo_enc); FREE4ALL; return 0; }
     }
 
-    /* ---- Encode offset-hi stream ----------------------------------- */
     size_t   enc_off_hi = 0;
     uint8_t *off_hi_enc = NULL;
     if (off_hi_len > 0) {
-        enc_off_hi = rans_encode(off_hi_buf, off_hi_len, off_hi_syms, scratch, scratch_cap);
-        if (!enc_off_hi) { if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        off_hi_enc = (uint8_t *)malloc(enc_off_hi);
-        if (!off_hi_enc) { if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
-        memcpy(off_hi_enc, scratch, enc_off_hi);
+        size_t cap = off_hi_len + (off_hi_len >> 4) + 64;
+        off_hi_enc = (uint8_t *)malloc(cap);
+        zxl_ac_prob *p = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
+        if (!off_hi_enc || !p) { free(off_hi_enc); free(p); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
+        for (int k=0; k<256; k++) p[k] = ZXL_AC_PROB_INIT;
+        zxl_ac_enc rc; zxl_ac_enc_init(&rc, off_hi_enc, cap);
+        for (size_t j=0; j<off_hi_len; j++) zxl_ac_enc_byte(&rc, p, off_hi_buf[j]);
+        enc_off_hi = zxl_ac_enc_finish(&rc);
+        free(p);
+        if (!enc_off_hi) { free(off_hi_enc); if(off_lo_enc)free(off_lo_enc); FREE4ALL; return 0; }
     }
 
     /* ---- Encode delta stream (mtype + delta bytes only) ----------- */
@@ -1611,8 +1617,8 @@ static size_t compress_block(MatchCtx *ctx,
      */
     #define N_HDR_FIELDS 15
     /* Worst-case freq tables: 1 mode byte + ZXL_COMPACT_FREQ_MAX dense payload per table.
-     * 6 main tables (am, al, off_lo, off_hi, delta, len). Literals use AC: no header tables. */
-    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*6;
+     * 4 rANS tables (am, al, delta, len). Literals + off_lo + off_hi use AC: no header tables. */
+    size_t hdr_size = 4*N_HDR_FIELDS + (ZXL_COMPACT_FREQ_MAX + 1)*4;
 
     size_t total_opcode = enc_opcode_am + enc_opcode_al;
     size_t total_needed = hdr_size + total_opcode + enc_off_lo + enc_off_hi + enc_delta + enc_len + lit_enc_total;
@@ -1654,11 +1660,9 @@ static size_t compress_block(MatchCtx *ctx,
     write_u32(p, (uint32_t)lbuf_size);         p += 4;  /* [13] dec_len */
     write_u32(p, (uint32_t)lit_len);           p += 4;  /* [14] dec_lit */
 
-    /* D1.5 compact freq tables for the 6 rANS streams (literals use AC, no table). */
+    /* D1.5 compact freq tables for the 4 rANS streams (literals + offsets use AC). */
     p += write_freqs_tagged(p, am_mode,     am_syms,     am_row,     am_col);
     p += write_freqs_tagged(p, al_mode,     al_syms,     al_row,     al_col);
-    p += write_freqs_tagged(p, off_lo_mode, off_lo_syms, off_lo_row, off_lo_col);
-    p += write_freqs_tagged(p, off_hi_mode, off_hi_syms, off_hi_row, off_hi_col);
     p += write_freqs_tagged(p, delta_mode,  delta_syms,  delta_row,  delta_col);
     p += write_freqs_tagged(p, len_mode,    len_syms,    len_row,    len_col);
 
@@ -1757,11 +1761,7 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
     RansSym  al_syms[256];  RansSlot al_slots[RANS_SCALE];
     READ_COMPACT_FREQS_INTO(al_syms, al_slots);
 
-    /* Offset-lo / offset-hi / delta / len freq tables */
-    RansSym  off_lo_syms_d[256];  RansSlot off_lo_slots_d[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(off_lo_syms_d, off_lo_slots_d);
-    RansSym  off_hi_syms_d[256];  RansSlot off_hi_slots_d[RANS_SCALE];
-    READ_COMPACT_FREQS_INTO(off_hi_syms_d, off_hi_slots_d);
+    /* Delta / len freq tables (off_lo + off_hi are adaptive AC, no tables). */
     RansSym  delta_syms[256];  RansSlot delta_slots[RANS_SCALE];
     READ_COMPACT_FREQS_INTO(delta_syms, delta_slots);
     RansSym  len_syms[256];  RansSlot len_slots[RANS_SCALE];
@@ -1798,24 +1798,36 @@ static size_t decompress_block(const uint8_t *src, size_t src_len,
 
     #define FREE2BUF free(opcode_al_buf); free(opcode_am_buf)
 
-    /* Decode offset-lo stream */
+    /* Decode offset-lo stream (unconditional adaptive AC). */
     uint8_t *off_lo_buf_d = NULL;
     if (off_lo_dec_len > 0) {
         off_lo_buf_d = (uint8_t *)malloc(off_lo_dec_len + 64);
-        if (!off_lo_buf_d) { FREE2BUF; return 0; }
-        if (rans_decode(off_lo_stream, off_lo_size, off_lo_slots_d, off_lo_buf_d, off_lo_dec_len) != 0) {
-            free(off_lo_buf_d); FREE2BUF; return 0;
+        zxl_ac_prob *pp = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
+        if (!off_lo_buf_d || !pp) { free(off_lo_buf_d); free(pp); FREE2BUF; return 0; }
+        for (int k=0; k<256; k++) pp[k] = ZXL_AC_PROB_INIT;
+        zxl_ac_dec rd;
+        if (zxl_ac_dec_init(&rd, off_lo_stream, off_lo_size) != 0) {
+            free(off_lo_buf_d); free(pp); FREE2BUF; return 0;
         }
+        for (uint32_t j=0; j<off_lo_dec_len; j++)
+            off_lo_buf_d[j] = (uint8_t)zxl_ac_dec_byte(&rd, pp);
+        free(pp);
     }
 
-    /* Decode offset-hi stream */
+    /* Decode offset-hi stream (unconditional adaptive AC). */
     uint8_t *off_hi_buf_d = NULL;
     if (off_hi_dec_len > 0) {
         off_hi_buf_d = (uint8_t *)malloc(off_hi_dec_len + 64);
-        if (!off_hi_buf_d) { if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
-        if (rans_decode(off_hi_stream, off_hi_size, off_hi_slots_d, off_hi_buf_d, off_hi_dec_len) != 0) {
-            free(off_hi_buf_d); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
+        zxl_ac_prob *pp = (zxl_ac_prob *)malloc(256 * sizeof(zxl_ac_prob));
+        if (!off_hi_buf_d || !pp) { free(off_hi_buf_d); free(pp); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0; }
+        for (int k=0; k<256; k++) pp[k] = ZXL_AC_PROB_INIT;
+        zxl_ac_dec rd;
+        if (zxl_ac_dec_init(&rd, off_hi_stream, off_hi_size) != 0) {
+            free(off_hi_buf_d); free(pp); if(off_lo_buf_d)free(off_lo_buf_d); FREE2BUF; return 0;
         }
+        for (uint32_t j=0; j<off_hi_dec_len; j++)
+            off_hi_buf_d[j] = (uint8_t)zxl_ac_dec_byte(&rd, pp);
+        free(pp);
     }
 
     /* Decode delta stream — mtype+deltaval bytes */
